@@ -18,6 +18,13 @@ from src.api.webvpn import WebVPNSession, get_vpn_url
 
 _DATE_FROM_SUB_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
+#: ``(sub_id, kind)`` pairs whose video-source information has already been
+#: reported, where ``kind`` is ``"candidates"`` or ``"picked"``.  The
+#: downloader calls ``get_video_url(..., verbose=False)`` once per HTTP
+#: request (a fresh signature is minted for every one of them), so the
+#: diagnostics below have to guard themselves rather than rely on ``verbose``.
+_VIDEO_SOURCE_REPORTED: set[tuple[str, str]] = set()
+
 
 def _extract_date_from_sub(sub_title: str) -> str | None:
     """Extract YYYY-MM-DD from a sub_title like "2026-03-05第6-8节"."""
@@ -495,6 +502,13 @@ class ICourseClient:
 
         # Extract base video URL from playurl dict or video_list
         base_url = None
+        #: Which of the four sources above actually supplied the URL.  This is
+        #: the single most useful fact when a download yields a full-length
+        #: container with a silent audio track: ``video_list.preview_url``
+        #: means the school published a finished recording, whereas
+        #: ``content.playback.url`` means we are on the pre-release fallback
+        #: and the recording is very likely still being generated.
+        source = None
 
         # Try video_list first (has preview_url without /0/ prefix)
         video_list = info.get("video_list", {})
@@ -507,11 +521,24 @@ class ICourseClient:
                         candidates.append((str(k), preview))
                         if base_url is None:
                             base_url = preview
-        if candidates and verbose:
-            # Diagnostic only: log host+path of every candidate (never the
-            # query string — it may carry a signature token).  Upstream
-            # issue #44 showed video_list can expose several MP4s per
-            # lecture and the first one is not always the right one.
+                            source = f"video_list[{k}].preview_url"
+
+        # Diagnostic only: log host+path of every candidate (never the query
+        # string — it may carry a signature token).  Upstream issue #44 showed
+        # video_list can expose several MP4s per lecture and the first one is
+        # not always the right one, which would silently hand back a
+        # live-stream container whose audio track is still empty.
+        #
+        # ``verbose`` is False on the downloader's hot path — that is exactly
+        # where the answer matters, so fire regardless of it whenever there is
+        # a real choice to make (2+ candidates) or none at all (we are about
+        # to fall back to the review-gated source).  ``_VIDEO_SOURCE_REPORTED``
+        # keeps that to one report per lecture instead of one per signed HTTP
+        # request.
+        ambiguous = len(candidates) > 1 or not candidates
+        if (verbose or ambiguous) \
+                and (sub_id, "candidates") not in _VIDEO_SOURCE_REPORTED:
+            _VIDEO_SOURCE_REPORTED.add((sub_id, "candidates"))
             print(f"    [VideoDiag] {sub_id}: video_list exposes "
                   f"{len(candidates)} .mp4 candidate(s)", flush=True)
             for _k, _u in candidates:
@@ -542,6 +569,7 @@ class ICourseClient:
                         continue
                     if isinstance(v, str) and v.endswith(".mp4"):
                         base_url = v
+                        source = f"playurl[{k}]"
                         break
 
         # Review-gate fallback: nested content.playback.url is preserved
@@ -551,6 +579,7 @@ class ICourseClient:
             nested = playback.get("url")
             if isinstance(nested, str) and nested.endswith(".mp4"):
                 base_url = nested
+                source = "content.playback.url (review-gated)"
                 if not now:
                     content_now = (info.get("content") or {}).get("now")
                     if isinstance(content_now, (int, str)):
@@ -564,6 +593,7 @@ class ICourseClient:
                 playback = content.get("playback", {})
                 if playback and playback.get("url"):
                     base_url = playback["url"]
+                    source = "sub_detail.content.playback.url"
             except Exception:
                 pass
 
@@ -571,6 +601,15 @@ class ICourseClient:
             print(f"    No video URL found for {sub_id} (tried video_list, "
                   f"playurl, content.playback, sub_detail)")
             return None
+
+        # One line per lecture naming the winning source, so a silent-audio
+        # download can be told apart from a healthy one without a second run.
+        # Unlike the landscape dump above this is always emitted — it is a
+        # single line, and it is the line that matters.  Same self-guard:
+        # on the hot path this method is called once per HTTP request.
+        if (sub_id, "picked") not in _VIDEO_SOURCE_REPORTED:
+            _VIDEO_SOURCE_REPORTED.add((sub_id, "picked"))
+            print(f"    [VideoSource] {sub_id}: {source}", flush=True)
 
         return self.sign_video_url(base_url, now=now)
 
