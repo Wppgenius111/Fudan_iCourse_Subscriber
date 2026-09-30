@@ -20,7 +20,7 @@ import os
 import subprocess
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -132,6 +132,7 @@ class AudioHandle:
     process: subprocess.Popen
     stderr_chunks: list[bytes]
     stderr_head_parts: list[bytes] = field(default_factory=list)
+    mp4_path: str = ""   # intermediate MP4 fetched via Range ("" if streamed)
 
     @property
     def stderr_head(self) -> bytes:
@@ -216,20 +217,47 @@ class AudioDownloader:
         try:
             self._sem.acquire()
             try:
-                url = client.get_video_url(course_id, sub_id)
-                if not url:
-                    self._pop_if_mine(sub_id, pending)
-                    self._sem.release()
-                    return
-                vpn_url, headers = client.get_stream_params(url)
-                threading.Thread(
-                    target=self._probe_stream,
-                    args=(client, vpn_url, sub_id),
-                    name=f"audio-probe-{sub_id}", daemon=True,
-                ).start()
                 path = os.path.join(self._dir, f"{sub_id}.raw")
                 if os.path.exists(path):
                     os.remove(path)
+
+                # Pull the MP4 down ourselves first.  The proxy drops a large
+                # response at ~250 MiB of a ~2.7 GB file and ffmpeg reads
+                # that as a *clean* EOF, so streaming the URL directly
+                # silently yields only the first ~68 of ~162 minutes.
+                # Fetching in parallel Range chunks gets the whole file;
+                # only if Range turns out to be unusable do we fall back to
+                # the old direct-stream behaviour.
+                mp4_path = os.path.join(self._dir, f"{sub_id}.mp4")
+                fetched, total = self._fetch_mp4(
+                    client, course_id, sub_id, mp4_path)
+                complete = fetched > 0 and (total is None or fetched >= total)
+                if complete:
+                    src = mp4_path
+                    vpn_url, headers = "", ""
+                    print(f"    [Fetch] {sub_id} complete: "
+                          f"{fetched / 1048576:.1f} MiB"
+                          + (f" of {total / 1048576:.1f} MiB"
+                             if total else ""), flush=True)
+                else:
+                    # Either Range is unusable or we still came up short.
+                    # Fall back to the original direct-stream behaviour so
+                    # this change can never be worse than what it replaces.
+                    # The URL needs a *fresh* signature: the one burnt by the
+                    # size probe is single-use and would answer 403.
+                    vpn_url, headers = self._sign_stream(
+                        client, course_id, sub_id)
+                    if not vpn_url:
+                        self._pop_if_mine(sub_id, pending)
+                        self._sem.release()
+                        return
+                    src = vpn_url
+                    print(f"    [Fetch] {sub_id} incomplete "
+                          f"({fetched / 1048576:.1f} MiB"
+                          + (f" of {total / 1048576:.1f} MiB"
+                             if total else "") +
+                          f") — falling back to streaming the URL",
+                          flush=True)
 
                 cmd = [
                     "ffmpeg", "-y",
@@ -237,7 +265,7 @@ class AudioDownloader:
                     "-reconnect", "1",
                     "-reconnect_streamed", "1",
                     "-reconnect_delay_max", "5",
-                    "-i", vpn_url,
+                    "-i", src,
                     "-vn",
                     "-ar", "16000",
                     "-ac", "1",
@@ -281,6 +309,7 @@ class AudioDownloader:
                     sub_id=sub_id, path=path,
                     process=proc, stderr_chunks=stderr_chunks,
                     stderr_head_parts=stderr_head_parts,
+                    mp4_path=mp4_path,
                 )
 
                 # Install the handle — unless release() already removed our
@@ -329,34 +358,179 @@ class AudioDownloader:
         handle.process.wait()
         self._sem.release()
 
-    @staticmethod
-    def _probe_stream(client, vpn_url: str, sub_id: str) -> None:
-        """Diagnostic: ask the server how big the file is and whether it
-        honours HTTP Range.
+    #: Bytes per HTTP Range request.  Measured: the WebVPN proxy hands over
+    #: ~250 MiB and then drops the connection, so each request must ask for
+    #: well under that.  A full lecture MP4 is ~2.6-2.7 GB, i.e. ~21 chunks.
+    FETCH_CHUNK = 128 * 1024 * 1024
 
-        Runs in its own thread so it never delays the ffmpeg spawn.  A
-        single ``Range: bytes=0-0`` GET is used instead of HEAD because
-        the WebVPN reverse proxy does not always implement HEAD.  Only
-        sizes/headers are logged — never the URL, which carries a
-        signature token.
+    #: How many Range requests to keep in flight at once.  Each one uses its
+    #: own freshly-signed URL (the CDN appears to invalidate a signature once
+    #: it has been used), so they cannot share a token.
+    FETCH_PARALLEL = 4
+
+    #: Give up after this many chunk failures so a broken server cannot spin.
+    FETCH_MAX_FAILURES = 6
+
+    #: Attempts per chunk.  Normally one is enough (the chunk is well under
+    #: the proxy's ~250 MiB ceiling), but if the ceiling turns out to be
+    #: smaller each attempt still leaves its bytes on disk and the next one
+    #: only asks for the remainder.
+    FETCH_MAX_ATTEMPTS = 40
+
+    def _sign_stream(self, client, course_id: str, sub_id: str):
+        """Mint a fresh (signed URL, ffmpeg-style headers) pair.
+
+        The ``t=`` signature is time-stamped and appears to be single-use:
+        reusing one for a second request answers ``403 Forbidden`` (observed
+        when a diagnostic probe shared the URL ffmpeg was about to fetch).
+        Every HTTP request therefore gets its own signature.
         """
+        url = client.get_video_url(course_id, sub_id, verbose=False)
+        if not url:
+            return None, None
+        return client.get_stream_params(url)
+
+    def _probe_size(self, client, course_id: str, sub_id: str) -> int | None:
+        """Total size of the lecture MP4, or None if the server will not say.
+
+        Uses ``Range: bytes=0-0`` and reads ``Content-Range: bytes 0-0/<N>``,
+        which the CDN does answer (206).  This burns one signature, hence the
+        fresh one minted by ``_sign_stream`` for every call.
+        """
+        vpn_url, _ = self._sign_stream(client, course_id, sub_id)
+        if not vpn_url:
+            return None
         try:
             r = client.vpn.session.get(
                 vpn_url, headers={"Range": "bytes=0-0"},
-                stream=True, timeout=30, allow_redirects=True,
+                stream=True, timeout=(30, 120), allow_redirects=True,
             )
-            print(
-                f"    [VideoDiag] {sub_id} probe: status={r.status_code} "
-                f"content-length={r.headers.get('content-length')} "
-                f"content-range={r.headers.get('content-range')} "
-                f"accept-ranges={r.headers.get('accept-ranges')} "
-                f"content-type={r.headers.get('content-type')}",
-                flush=True,
-            )
+            cr = r.headers.get("content-range", "")
+            status = r.status_code
             r.close()
+            if status == 206 and "/" in cr:
+                total = int(cr.rsplit("/", 1)[1])
+                print(f"    [Fetch] {sub_id} size probe: {total} bytes "
+                      f"({total / 1048576:.0f} MiB), Range supported",
+                      flush=True)
+                return total
+            print(f"    [Fetch] {sub_id} size probe: status={status} "
+                  f"content-range={cr!r} — Range unsupported", flush=True)
         except Exception as e:
-            print(f"    [VideoDiag] {sub_id} probe failed: "
+            print(f"    [Fetch] {sub_id} size probe failed: "
                   f"{type(e).__name__}: {e}", flush=True)
+        return None
+
+    def _fetch_chunk(self, client, course_id: str, sub_id: str, fd: int,
+                     start: int, end: int, path: str) -> int:
+        """Fetch ``bytes=start-end`` (inclusive) and pwrite it at ``start``.
+
+        Returns the number of bytes written.  Each call mints its own
+        signature; a partial result is still useful because the caller
+        retries the missing span.
+        """
+        vpn_url, _ = self._sign_stream(client, course_id, sub_id)
+        if not vpn_url:
+            return 0
+        written = 0
+        pos = start
+        try:
+            resp = client.vpn.session.get(
+                vpn_url, headers={"Range": f"bytes={pos}-{end}"},
+                stream=True, timeout=(30, 120), allow_redirects=True,
+            )
+        except Exception as e:
+            print(f"    [Fetch] {sub_id} chunk {start}-{end} connect "
+                  f"failed: {type(e).__name__}", flush=True)
+            return 0
+        try:
+            with resp:
+                if resp.status_code not in (200, 206):
+                    print(f"    [Fetch] {sub_id} chunk {start}-{end}: "
+                          f"HTTP {resp.status_code}", flush=True)
+                    return 0
+                for chunk in resp.iter_content(1 << 16):
+                    if not chunk:
+                        continue
+                    os.pwrite(fd, chunk, pos)
+                    pos += len(chunk)
+                    written += len(chunk)
+                    if pos > end:
+                        break
+        except Exception as e:
+            print(f"    [Fetch] {sub_id} chunk {start}-{end} interrupted "
+                  f"after {written / 1048576:.1f} MiB: {type(e).__name__}",
+                  flush=True)
+        return written
+
+    def _fetch_mp4(self, client, course_id: str, sub_id: str,
+                   path: str) -> tuple[int, int | None]:
+        """Download the whole lecture MP4 with parallel HTTP Range requests.
+
+        Returns ``(bytes_on_disk, total_or_None)``.
+
+        Why not let ffmpeg stream the URL directly: the WebVPN reverse proxy
+        drops a large response after ~250 MiB of a ~2.7 GB file, and ffmpeg
+        reads that as a *clean* EOF — it exits 0 without ever reconnecting,
+        so we silently end up with roughly the first 68 minutes of a
+        162-minute lecture.  ffmpeg has no ``reconnect_at_eof`` option, so
+        the resume has to happen here.
+        """
+        total = self._probe_size(client, course_id, sub_id)
+        if not total:
+            return 0, None
+
+        spans: list[tuple[int, int]] = []
+        off = 0
+        while off < total:
+            spans.append((off, min(off + self.FETCH_CHUNK - 1, total - 1)))
+            off += self.FETCH_CHUNK
+
+        done = bytearray(len(spans))       # 1 = span fully on disk
+        failures = 0
+        with open(path, "wb") as f:
+            f.truncate(total)
+            fd = f.fileno()
+
+            def worker(idx: int) -> None:
+                nonlocal failures
+                start, end = spans[idx]
+                # Retry the same span while it is making progress; a chunk
+                # that dies mid-way still leaves its bytes on disk, so the
+                # next attempt only asks for the remainder.
+                pos = start
+                for _ in range(self.FETCH_MAX_ATTEMPTS):
+                    got = self._fetch_chunk(
+                        client, course_id, sub_id, fd, pos, end, path)
+                    if got <= 0:
+                        break
+                    pos += got
+                    if pos > end:
+                        done[idx] = 1
+                        return
+                failures += 1
+
+            pending = list(range(len(spans)))
+            with ThreadPoolExecutor(max_workers=self.FETCH_PARALLEL) as pool:
+                futures = {pool.submit(worker, i): i for i in pending}
+                for fut in as_completed(futures):
+                    if fut.exception():
+                        print(f"    [Fetch] {sub_id} chunk error: "
+                              f"{fut.exception()}", flush=True)
+                    if failures >= self.FETCH_MAX_FAILURES:
+                        break
+                pool.shutdown(wait=False, cancel_futures=True)
+
+            fetched = sum(
+                min(spans[i][1], total - 1) - spans[i][0] + 1
+                for i in range(len(spans)) if done[i]
+            )
+        print(f"    [Fetch] {sub_id}: {fetched / 1048576:.0f} MiB of "
+              f"{total / 1048576:.0f} MiB "
+              f"({sum(done)}/{len(spans)} chunks, {failures} failed)",
+              flush=True)
+        return fetched, total
+
 
     def get(self, sub_id: str, timeout: float = 120.0) -> AudioHandle | None:
         """Block until ffmpeg has been spawned for sub_id; return its handle.
@@ -403,11 +577,13 @@ class AudioDownloader:
                 proc.kill()
                 proc.wait()
         # The monitor thread releases the semaphore on its own.
-        if os.path.exists(handle.path):
-            try:
-                os.remove(handle.path)
-            except OSError:
-                pass
+        # Clean up both the decoded PCM and the intermediate MP4 we fetched.
+        for p in (handle.path, handle.mp4_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     def shutdown(self) -> None:
         """Kill every in-flight ffmpeg and wipe the scratch directory."""

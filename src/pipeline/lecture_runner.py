@@ -298,8 +298,12 @@ class LectureRunner:
         # first lecture in the batch we still need to fire it ourselves.
         downloader = self._scheduler.audio_downloader
         downloader.schedule(self._client, course_id, sub_id)
+        # The handle now only appears once the whole MP4 has been fetched
+        # (see AudioDownloader._fetch_mp4), so this wait has to cover a
+        # multi-hundred-megabyte download — not the few seconds it used to
+        # take when ffmpeg was handed the URL directly.
         try:
-            handle = downloader.get(sub_id, timeout=120)
+            handle = downloader.get(sub_id, timeout=1800)
         except TimeoutError as e:
             self._reporter.info(f"    [SKIP] {e}")
             self._db.update_error(sub_id, "transcribe", str(e))

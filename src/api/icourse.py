@@ -463,7 +463,8 @@ class ICourseClient:
 
         return payload
 
-    def get_video_url(self, course_id: str, sub_id: str) -> str | None:
+    def get_video_url(self, course_id: str, sub_id: str,
+                      verbose: bool = True) -> str | None:
         """Get a signed MP4 video URL for a specific lecture.
 
         Cascades through URL sources, most- to least-preferred:
@@ -506,7 +507,7 @@ class ICourseClient:
                         candidates.append((str(k), preview))
                         if base_url is None:
                             base_url = preview
-        if candidates:
+        if candidates and verbose:
             # Diagnostic only: log host+path of every candidate (never the
             # query string — it may carry a signature token).  Upstream
             # issue #44 showed video_list can expose several MP4s per
@@ -516,6 +517,21 @@ class ICourseClient:
             for _k, _u in candidates:
                 _p = urlparse(_u)
                 print(f"      [{_k}] {_p.netloc}{_p.path}", flush=True)
+            # Also dump the *shape* of each candidate dict: a field like
+            # audioUrl / duration would let us skip the 2.7 GB video
+            # entirely.  Only keys and URL host+path are printed.
+            if isinstance(video_list, dict):
+                for _k, _v in video_list.items():
+                    if not isinstance(_v, dict):
+                        continue
+                    _keys = sorted(_v.keys())
+                    print(f"      [{_k}] keys={_keys}", flush=True)
+                    for _f in _keys:
+                        _val = _v[_f]
+                        if isinstance(_val, str) and ".mp4" in _val:
+                            _p2 = urlparse(_val)
+                            print(f"      [{_k}].{_f} = "
+                                  f"{_p2.netloc}{_p2.path}", flush=True)
 
         # Fallback: try playurl dict (has /0/ prefix, may need stripping)
         if not base_url:
