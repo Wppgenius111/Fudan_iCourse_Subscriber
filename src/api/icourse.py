@@ -497,13 +497,25 @@ class ICourseClient:
 
         # Try video_list first (has preview_url without /0/ prefix)
         video_list = info.get("video_list", {})
+        candidates: list[tuple[str, str]] = []
         if isinstance(video_list, dict):
-            for _, v in video_list.items():
+            for k, v in video_list.items():
                 if isinstance(v, dict):
                     preview = v.get("preview_url")
                     if preview and preview.endswith(".mp4"):
-                        base_url = preview
-                        break
+                        candidates.append((str(k), preview))
+                        if base_url is None:
+                            base_url = preview
+        if candidates:
+            # Diagnostic only: log host+path of every candidate (never the
+            # query string — it may carry a signature token).  Upstream
+            # issue #44 showed video_list can expose several MP4s per
+            # lecture and the first one is not always the right one.
+            print(f"    [VideoDiag] {sub_id}: video_list exposes "
+                  f"{len(candidates)} .mp4 candidate(s)", flush=True)
+            for _k, _u in candidates:
+                _p = urlparse(_u)
+                print(f"      [{_k}] {_p.netloc}{_p.path}", flush=True)
 
         # Fallback: try playurl dict (has /0/ prefix, may need stripping)
         if not base_url:

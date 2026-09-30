@@ -335,6 +335,7 @@ class LectureRunner:
             self._reporter.info(
                 f"    [SKIP] Incomplete audio, will retry next run: {e}"
             )
+            self._dump_audio_diag(sub_id, handle)
             self._db.update_error(sub_id, "transcribe", str(e))
             self._release_audio(sub_id)
             return None, None
@@ -348,6 +349,35 @@ class LectureRunner:
 
         self._db.update_transcript(sub_id, transcript)
         return transcript, segments
+
+    def _dump_audio_diag(self, sub_id: str, handle) -> None:
+        """Diagnostic only: surface ffmpeg's own view of the file.
+
+        When a download comes up short the interesting question is whether
+        the MP4 really is that short (a per-track property) or whether the
+        transfer was cut (a transport property).  ffmpeg's ``Input #0`` /
+        ``Duration:`` / ``Stream #`` lines answer that — and they are
+        dropped from the normal log because they only appear at the head of
+        stderr.  Only the structural lines are printed; progress spam and
+        the URL (which carries a signature token) are omitted.
+        """
+        try:
+            rc = handle.process.poll()
+            head = handle.stderr_head.decode(errors="replace")
+            keep = [
+                ln.strip() for ln in head.splitlines()
+                if ("Input #" in ln or "Duration:" in ln
+                    or "Stream #" in ln or "Output #" in ln
+                    or "error" in ln.lower())
+            ]
+            self._reporter.info(
+                f"    [VideoDiag] {sub_id}: ffmpeg rc={rc}, "
+                f"{len(keep)} structural stderr line(s)"
+            )
+            for ln in keep[:12]:
+                self._reporter.info(f"      | {ln}")
+        except Exception:
+            pass
 
     def _summarize(self, sub_id: str, course_title: str, transcript: str,
                    transcript_segments: list[dict] | None) -> Optional[str]:

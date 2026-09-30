@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from src.runtime import config
@@ -131,6 +131,17 @@ class AudioHandle:
     path: str          # disk file ffmpeg writes f32le mono 16 kHz to
     process: subprocess.Popen
     stderr_chunks: list[bytes]
+    stderr_head_parts: list[bytes] = field(default_factory=list)
+
+    @property
+    def stderr_head(self) -> bytes:
+        """First ~8 KB of ffmpeg stderr.
+
+        Holds the ``Input #0`` / ``Duration:`` / ``Stream #`` lines — the
+        only place that reveals how many tracks the MP4 has and how long
+        each track is.  The tail of stderr is progress spam, so it is kept
+        separately (``stderr_chunks``)."""
+        return b"".join(self.stderr_head_parts)
 
 
 class _PendingSpawn:
@@ -211,6 +222,11 @@ class AudioDownloader:
                     self._sem.release()
                     return
                 vpn_url, headers = client.get_stream_params(url)
+                threading.Thread(
+                    target=self._probe_stream,
+                    args=(client, vpn_url, sub_id),
+                    name=f"audio-probe-{sub_id}", daemon=True,
+                ).start()
                 path = os.path.join(self._dir, f"{sub_id}.raw")
                 if os.path.exists(path):
                     os.remove(path)
@@ -234,16 +250,25 @@ class AudioDownloader:
                 )
 
                 # Drain stderr so the pipe never deadlocks.  Keep last few KB
-                # for diagnostics if ffmpeg dies.
+                # for diagnostics if ffmpeg dies, plus the *head* — the
+                # ``Input #0`` / ``Duration:`` / ``Stream #`` lines that tell
+                # us how many tracks the file really has and how long each
+                # one is (the tail is pure progress spam).
                 stderr_chunks: list[bytes] = []
+                stderr_head_parts: list[bytes] = []
+                head_bytes = 0
 
                 def _drain():
+                    nonlocal head_bytes
                     try:
                         for chunk in proc.stderr:
                             stderr_chunks.append(chunk)
                             if len(stderr_chunks) > 2048:
                                 # keep only the tail to bound memory
                                 del stderr_chunks[: -1024]
+                            if head_bytes < 8192:
+                                stderr_head_parts.append(chunk)
+                                head_bytes += len(chunk)
                     except Exception:
                         pass
 
@@ -255,6 +280,7 @@ class AudioDownloader:
                 handle = AudioHandle(
                     sub_id=sub_id, path=path,
                     process=proc, stderr_chunks=stderr_chunks,
+                    stderr_head_parts=stderr_head_parts,
                 )
 
                 # Install the handle — unless release() already removed our
@@ -302,6 +328,35 @@ class AudioDownloader:
     def _monitor(self, handle: AudioHandle):
         handle.process.wait()
         self._sem.release()
+
+    @staticmethod
+    def _probe_stream(client, vpn_url: str, sub_id: str) -> None:
+        """Diagnostic: ask the server how big the file is and whether it
+        honours HTTP Range.
+
+        Runs in its own thread so it never delays the ffmpeg spawn.  A
+        single ``Range: bytes=0-0`` GET is used instead of HEAD because
+        the WebVPN reverse proxy does not always implement HEAD.  Only
+        sizes/headers are logged — never the URL, which carries a
+        signature token.
+        """
+        try:
+            r = client.vpn.session.get(
+                vpn_url, headers={"Range": "bytes=0-0"},
+                stream=True, timeout=30, allow_redirects=True,
+            )
+            print(
+                f"    [VideoDiag] {sub_id} probe: status={r.status_code} "
+                f"content-length={r.headers.get('content-length')} "
+                f"content-range={r.headers.get('content-range')} "
+                f"accept-ranges={r.headers.get('accept-ranges')} "
+                f"content-type={r.headers.get('content-type')}",
+                flush=True,
+            )
+            r.close()
+        except Exception as e:
+            print(f"    [VideoDiag] {sub_id} probe failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
 
     def get(self, sub_id: str, timeout: float = 120.0) -> AudioHandle | None:
         """Block until ffmpeg has been spawned for sub_id; return its handle.

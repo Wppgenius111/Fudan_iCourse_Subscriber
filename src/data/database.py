@@ -192,8 +192,16 @@ class Database:
             ).fetchall()
         return {row["sub_id"] for row in rows}
 
+    #: Retry ceiling for a lecture that keeps failing.  Upstream default is
+    #: 3, which abandons a lecture permanently after three bad runs.  Raised
+    #: here (env-overridable) because a transport-level failure — e.g. the
+    #: WebVPN proxy cutting a download short — is not the lecture's fault and
+    #: should not cost it its place in the queue while the cause is being
+    #: investigated.
+    DEFAULT_MAX_ERRORS = int(os.environ.get("FICS_MAX_ERRORS", "30"))
+
     def get_unprocessed_lectures(self, course_id: str | None = None,
-                                  max_errors: int = 3) -> list[dict]:
+                                  max_errors: int | None = None) -> list[dict]:
         """Return lectures that need (re-)processing.
 
         Only returns lectures whose ``error_count`` is below *max_errors* —
@@ -201,6 +209,8 @@ class Database:
         for a removed recording) is abandoned after that many attempts
         rather than clogging every workflow run.
         """
+        if max_errors is None:
+            max_errors = self.DEFAULT_MAX_ERRORS
         query = (
             "SELECT * FROM lectures"
             " WHERE processed_at IS NULL"
