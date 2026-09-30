@@ -1,0 +1,10 @@
+name: Probe P1
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo p1

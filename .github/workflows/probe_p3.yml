@@ -1,0 +1,15 @@
+name: Probe P3
+on:
+  workflow_dispatch:
+    inputs:
+      course_ids:
+        description: "ids"
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  single:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo p3
