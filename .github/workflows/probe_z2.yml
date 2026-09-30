@@ -1,0 +1,18 @@
+name: Probe Z2
+
+on:
+  workflow_dispatch:
+    inputs:
+      course_ids:
+        description: "Comma-separated course IDs to process (e.g. 30004,30005)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok

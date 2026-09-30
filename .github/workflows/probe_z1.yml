@@ -1,0 +1,26 @@
+name: Probe Z1
+
+on:
+  workflow_dispatch:
+    inputs:
+      course_ids:
+        description: "Comma-separated course IDs to process (e.g. 30004,30005)"
+        required: true
+        type: string
+      use_official_transcript:
+        description: "Use official iCourse transcripts instead of ASR"
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
