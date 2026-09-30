@@ -107,7 +107,7 @@ class Summarizer:
         )
         if not response.choices:
             raise ValueError("API returned empty choices — likely content filter or quota exceeded")
-        result = response.choices[0].message.content
+        result = response.choices[0].message.content or ""
         elapsed = time.time() - t0
         # Token usage helps explain run cost — every provider's billing is
         # token-based, and rate-limit decisions key off prompt size much
@@ -127,6 +127,22 @@ class Summarizer:
             print(
                 f"[Summarizer] Done ({model}): {len(content)} chars input"
                 f" → {len(result)} chars output in {elapsed:.0f}s"
+            )
+
+        if not result.strip():
+            # A reasoning-style model can burn thousands of completion
+            # tokens and still leave ``content`` empty (everything went into
+            # ``reasoning_content``).  Accepting "" here would store an empty
+            # summary, mark the lecture as processed, and it would never be
+            # retried — the transcript would be lost for good.  Fail loudly
+            # instead so ``summarize()`` moves on to the next model, and if
+            # they all fail the lecture is simply retried next run.
+            reasoning = getattr(
+                response.choices[0].message, "reasoning_content", None)
+            raise ValueError(
+                "model returned empty content"
+                f" ({getattr(usage, 'completion_tokens', '?')} completion "
+                f"tokens, reasoning_content={'present' if reasoning else 'absent'})"
             )
         return result
 
