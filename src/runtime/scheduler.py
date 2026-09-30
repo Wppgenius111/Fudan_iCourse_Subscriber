@@ -175,6 +175,12 @@ class AudioDownloader:
         self._active: dict[str, "AudioHandle | _PendingSpawn"] = {}
         self._lock = threading.Lock()
         self._reporter = reporter
+        # Serialises signature minting: the signed ``t=`` parameter has
+        # one-second resolution and is derived from the path, so two
+        # requests signed within the same second collide and the second one
+        # answers 403.
+        self._sign_lock = threading.Lock()
+        self._last_sign = 0.0
         os.makedirs(self._dir, exist_ok=True)
 
     @property
@@ -259,19 +265,8 @@ class AudioDownloader:
                           f") — falling back to streaming the URL",
                           flush=True)
 
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-headers", headers,
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
-                    "-i", src,
-                    "-vn",
-                    "-ar", "16000",
-                    "-ac", "1",
-                    "-f", "f32le",
-                    path,
-                ]
+                cmd = self._ffmpeg_cmd(src, path, headers,
+                                       is_url=(src == vpn_url))
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
@@ -377,15 +372,52 @@ class AudioDownloader:
     #: only asks for the remainder.
     FETCH_MAX_ATTEMPTS = 40
 
+    #: Minimum seconds between two signatures.  ``t=`` is built from the
+    #: server clock at one-second resolution, so back-to-back signatures for
+    #: the same file hash identically and the CDN rejects the duplicates.
+    SIGN_MIN_INTERVAL = 1.05
+
+    @staticmethod
+    def _ffmpeg_cmd(src: str, out_path: str, headers: str,
+                    is_url: bool) -> list[str]:
+        """Build the ffmpeg argv for extracting mono 16 kHz f32le audio.
+
+        ``-headers`` and the ``-reconnect*`` family belong to the *http*
+        protocol.  Passing them for a local file makes ffmpeg abort with
+        ``Option headers not found.`` (rc=8) before writing a single byte,
+        so they are only added on the direct-stream path.
+        """
+        net_opts = (["-headers", headers,
+                     "-reconnect", "1",
+                     "-reconnect_streamed", "1",
+                     "-reconnect_delay_max", "5"]
+                    if is_url else [])
+        return [
+            "ffmpeg", "-y",
+            *net_opts,
+            "-i", src,
+            "-vn",
+            "-ar", "16000",
+            "-ac", "1",
+            "-f", "f32le",
+            out_path,
+        ]
+
     def _sign_stream(self, client, course_id: str, sub_id: str):
         """Mint a fresh (signed URL, ffmpeg-style headers) pair.
 
-        The ``t=`` signature is time-stamped and appears to be single-use:
+        The ``t=`` signature is time-stamped and effectively single-use:
         reusing one for a second request answers ``403 Forbidden`` (observed
-        when a diagnostic probe shared the URL ffmpeg was about to fetch).
-        Every HTTP request therefore gets its own signature.
+        when a diagnostic probe shared the URL ffmpeg was about to fetch),
+        and two signatures minted in the same second collide.  Every HTTP
+        request therefore gets its own, deliberately spaced, signature.
         """
-        url = client.get_video_url(course_id, sub_id, verbose=False)
+        with self._sign_lock:
+            gap = time.time() - self._last_sign
+            if gap < self.SIGN_MIN_INTERVAL:
+                time.sleep(self.SIGN_MIN_INTERVAL - gap)
+            url = client.get_video_url(course_id, sub_id, verbose=False)
+            self._last_sign = time.time()
         if not url:
             return None, None
         return client.get_stream_params(url)
@@ -499,11 +531,20 @@ class AudioDownloader:
                 # that dies mid-way still leaves its bytes on disk, so the
                 # next attempt only asks for the remainder.
                 pos = start
+                zero_streak = 0
                 for _ in range(self.FETCH_MAX_ATTEMPTS):
                     got = self._fetch_chunk(
                         client, course_id, sub_id, fd, pos, end, path)
                     if got <= 0:
-                        break
+                        # A 403 from a collided signature is transient — the
+                        # next attempt mints a new one.  Only give up after
+                        # a few consecutive dead attempts.
+                        zero_streak += 1
+                        if zero_streak >= 3:
+                            break
+                        time.sleep(1.0)
+                        continue
+                    zero_streak = 0
                     pos += got
                     if pos > end:
                         done[idx] = 1

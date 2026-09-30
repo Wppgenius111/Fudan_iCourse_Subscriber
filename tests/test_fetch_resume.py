@@ -165,4 +165,17 @@ try:
 finally:
     AudioDownloader.FETCH_CHUNK = orig_chunk
 
+print("\nE. ffmpeg argv: http-only options must not leak onto a local file")
+HDR = "Cookie: a=b\r\n"
+local = AudioDownloader._ffmpeg_cmd("/d/x.mp4", "/d/x.raw", HDR, is_url=False)
+url = AudioDownloader._ffmpeg_cmd("https://h/x.mp4", "/d/x.raw", HDR, is_url=True)
+assert "-headers" not in local and "-reconnect" not in local, \
+    "local file input must not carry http-only options (rc=8)"
+assert local[local.index("-i") + 1] == "/d/x.mp4"
+assert "-headers" in url and "-reconnect_streamed" in url, \
+    "direct streaming must keep the http options"
+assert url[url.index("-i") + 1] == "https://h/x.mp4"
+print(f"  local: {local}")
+print(f"  url:   {url}")
+
 print("\nALL PASS")
