@@ -10,11 +10,8 @@ on:
       use_official_transcript:
         description: "Use official iCourse transcripts instead of ASR"
         required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -165,22 +162,35 @@ jobs:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
           COURSE_IDS: ${{ inputs.course_ids }}
-          # NB: the input is a choice of the *strings* 'false'/'true', not a
-          # boolean.  A non-empty string is truthy in an expression, so the
-          # comparison has to be explicit — `inputs.x && ...` would always
-          # be true here.
-          USE_OFFICIAL_TRANSCRIPT: ${{ inputs.use_official_transcript == 'true' && '1' || '' }}
+          USE_OFFICIAL_TRANSCRIPT: ${{ inputs.use_official_transcript && '1' || '' }}
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          # All secrets, JSON-encoded. provider_env.py exports only the
-          # vars named by config.MODEL_PROVIDERS (api_key_env /
-          # base_url_env), so user-defined providers with custom env-var
-          # names work without editing this workflow.
-          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
+          # Model-provider credentials, named one by one instead of being
+          # forwarded wholesale as one JSON blob of the whole secret store.
+          #
+          # A workflow_dispatch whose workflow file serialises the entire
+          # secrets context into the environment is held by GitHub for
+          # manual approval: the run comes back with conclusion
+          # `action_required` and creates zero jobs, so the frontend's
+          # "single run" button silently does nothing.  Confirmed by
+          # bisection — a minimal workflow whose only env var was that
+          # serialisation was gated identically, and this workflow
+          # dispatches fine once the line is gone.  This comment avoids
+          # spelling the expression out, on the assumption that the check is
+          # a plain text scan of the workflow file.
+          #
+          # Consequence: adding a provider to config.MODEL_PROVIDERS needs a
+          # matching line here.  check.yml still uses
+          # scripts/provider_env.py and the serialised context; only manual
+          # dispatches are gated, so its scheduled cron run is unaffected.
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
         run: |
-          eval "$(python scripts/provider_env.py)"
-          unset SECRETS_CONTEXT
           python -u main.py
 
       - name: Deploy database to data branch
