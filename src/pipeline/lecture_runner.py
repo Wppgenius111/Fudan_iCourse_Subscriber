@@ -42,7 +42,11 @@ from typing import TYPE_CHECKING, Optional
 
 from src.ai import bucketer
 from src.pipeline.ppt_pipeline import PPTPipeline
-from src.ai.transcriber import IncompleteAudioError, NoAudioStreamError
+from src.ai.transcriber import (
+    IncompleteAudioError,
+    NoAudioStreamError,
+    SparseAudioError,
+)
 from src.runtime import config
 
 if TYPE_CHECKING:
@@ -340,6 +344,20 @@ class LectureRunner:
                 f"    [SKIP] Incomplete audio, will retry next run: {e}"
             )
             self._dump_audio_diag(sub_id, handle)
+            self._db.update_error(sub_id, "transcribe", str(e))
+            self._release_audio(sub_id)
+            return None, None
+        except SparseAudioError as e:
+            # The download was complete but the recording holds almost no
+            # speech — iCourse publishes a lecture's media as soon as the
+            # class starts, so this run overlapped the class.  Persisting the
+            # near-empty transcript would mark the lecture processed and the
+            # real summary would never be produced; record the error instead
+            # so a later run picks it up once the recording is filled in.
+            self._reporter.info(
+                f"    [SKIP] Recording not generated yet, will retry next "
+                f"run: {e}"
+            )
             self._db.update_error(sub_id, "transcribe", str(e))
             self._release_audio(sub_id)
             return None, None

@@ -175,6 +175,20 @@ def _postprocess_segment(text: str) -> str:
     return text
 
 
+#: iCourse publishes a lecture's video entry the moment the class starts, so
+#: a run that overlaps the class (or fires before the recording has been
+#: processed) sees a full-length media file whose audio track is still
+#: silent.  Transcribing it yields a handful of characters, and storing that
+#: would mark the lecture processed — permanently suppressing the real
+#: summary.  Normal lectures run at roughly 140 chars/min; this floor sits
+#: far below any plausible real lecture (a 160-minute recording with 20
+#: minutes of speech still passes at ~17 chars/min), while catching a
+#: still-empty recording, which lands under 1.
+SPEECH_DENSITY_MIN_CHARS_PER_MIN = 5.0
+#: Don't judge short clips — a 5-minute recording can legitimately be sparse.
+SPEECH_DENSITY_MIN_MEDIA_SEC = 600.0
+
+
 class Transcriber:
     """Sherpa-onnx ASR transcriber with VAD segmentation.
 
@@ -205,6 +219,11 @@ class Transcriber:
         self._last_transcript = ""           # text from last transcription
         self._last_segments: list[dict] = []
         self._media_duration: Optional[float] = None
+        #: Characters of *real* speech in the last transcription, i.e.
+        #: excluding the synthetic "[注意：...未检测到语音...]" tail marker
+        #: that ``_consume_pcm_stream`` appends.  Used by the speech-density
+        #: check, which would otherwise be fooled by that marker's length.
+        self._last_speech_chars = 0
 
     # ── Model lifecycle ─────────────────────────────────────────────────
 
@@ -508,6 +527,9 @@ class Transcriber:
 
         speed_kbps = (total_bytes / 1024) / elapsed if elapsed > 0 else 0
         transcript = " ".join(s["text"] for s in segments)
+        # Record the speech length *before* the tail marker below is appended:
+        # the density check must not count the marker as content.
+        self._last_speech_chars = len(transcript)
 
         # Final silence check
         if (not silence_marked
@@ -564,6 +586,35 @@ class Transcriber:
                     transcript=transcript,
                     segments=segments,
                 )
+
+    def _check_speech_density(self) -> None:
+        """Raise SparseAudioError when a long recording contains almost no
+        speech.
+
+        This is the counterpart to ``_check_completeness``: that one catches a
+        *truncated* download, this one catches a *complete but empty* one.
+        iCourse creates the video entry when a class begins, so a run that
+        lands mid-class downloads the full 2 GB and transcribes silence.  The
+        transcript is short, so nothing downstream complains — it would be
+        stored, the lecture marked processed, and the real summary never
+        produced.
+
+        Skipped when the media duration is unknown or the recording is short.
+        """
+        if not self._media_duration or self._media_duration < SPEECH_DENSITY_MIN_MEDIA_SEC:
+            return
+        minutes = self._media_duration / 60
+        density = self._last_speech_chars / minutes
+        if density < SPEECH_DENSITY_MIN_CHARS_PER_MIN:
+            raise SparseAudioError(
+                f"{self._media_duration:.0f}s of audio ({minutes:.0f} min) "
+                f"contains only {self._last_speech_chars} chars of speech "
+                f"({density:.1f} chars/min, floor is "
+                f"{SPEECH_DENSITY_MIN_CHARS_PER_MIN:.0f}). The recording is "
+                f"probably still being generated.",
+                chars=self._last_speech_chars,
+                duration_s=self._media_duration,
+            )
 
     # ── Public mode 1 — disk tail-f (preferred) ─────────────────────────
 
@@ -630,6 +681,9 @@ class Transcriber:
             # this check the partial transcript would silently pass as a
             # complete lecture.
             self._check_completeness(transcript, segments)
+            # ...and a *complete* download can still be an empty recording,
+            # if this run overlapped the class it belongs to.
+            self._check_speech_density()
             return transcript, segments
         finally:
             f.close()
@@ -752,3 +806,16 @@ class IncompleteAudioError(RuntimeError):
 
 class NoAudioStreamError(RuntimeError):
     """Raised when the media contains no audio stream (video-only file)."""
+
+
+class SparseAudioError(RuntimeError):
+    """Raised when a full-length recording contains almost no speech.
+
+    The download was fine — the recording itself is still being generated
+    (iCourse publishes a lecture's media the moment the class starts), so the
+    result must not be stored as if it were a finished transcript."""
+
+    def __init__(self, message: str, chars: int, duration_s: float):
+        super().__init__(message)
+        self.chars = chars
+        self.duration_s = duration_s
