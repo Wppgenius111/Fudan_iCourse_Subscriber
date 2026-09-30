@@ -208,12 +208,35 @@ class Database:
         a permanently-failing lecture (e.g. ``get-sub-info`` RuntimeError
         for a removed recording) is abandoned after that many attempts
         rather than clogging every workflow run.
+
+        A lecture that was marked processed but whose ``summary`` is empty
+        is also returned.  That combination means a summary was lost — the
+        LLM answered with empty content and ``_summarize`` stored it, so
+        ``processed_at`` was set and the lecture would otherwise never be
+        looked at again.  ``LectureRunner`` already treats an empty summary
+        as "no summary" (``_has_summary``), and ``_get_transcript`` reuses
+        the cached transcript, so re-running one of these costs a single
+        LLM call and no download.  Requiring a non-empty transcript keeps
+        the deliberately-skipped cases (empty transcript, video without an
+        audio stream) out of the retry set — those legitimately have no
+        summary and would otherwise be re-queued forever.
         """
         if max_errors is None:
             max_errors = self.DEFAULT_MAX_ERRORS
+        # SQLite's one-argument TRIM() strips spaces only, so a summary of
+        # "\n" or a lone tab would still compare non-empty.  Spell the
+        # whitespace set out explicitly.
+        ws = "char(32)||char(9)||char(10)||char(13)"
         query = (
             "SELECT * FROM lectures"
-            " WHERE processed_at IS NULL"
+            " WHERE ("
+            "   processed_at IS NULL"
+            "   OR ("
+            "     (summary IS NULL"
+            f"      OR TRIM(summary, {ws}) = '')"
+            f"     AND TRIM(COALESCE(transcript, ''), {ws}) != ''"
+            "   )"
+            " )"
             "   AND (error_count IS NULL OR error_count < ?)"
         )
         params: tuple = (max_errors,)
