@@ -27,6 +27,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.database import Database  # noqa: E402
+from src.data.schema import SCHEMA_SQL  # noqa: E402
 
 
 @pytest.fixture()
@@ -256,4 +257,69 @@ def test_backfill_runs_only_once():
         assert d.conn.execute(
             "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
         ).fetchone()["silent_count"] == 11
+        d.conn.close()
+
+
+def _modern_db(tmp: str, rows: list[tuple]) -> str:
+    """A database built from the current ``SCHEMA_SQL``.
+
+    This is what the runner actually opens: ``sharder.reassemble_database``
+    creates the database from ``SCHEMA_SQL``, so every migration column —
+    ``silent_count`` included — is *already present* before ``Database``
+    ever sees it.  The ``ALTER TABLE`` branch in ``_init_tables`` therefore
+    never fires in CI.
+    """
+    path = os.path.join(tmp, "modern.db")
+    raw = sqlite3.connect(path)
+    raw.executescript(SCHEMA_SQL)
+    raw.executemany(
+        "INSERT INTO lectures (sub_id, course_id, error_count, silent_count,"
+        " error_stage, error_msg) VALUES (?, '38678', ?, ?, ?, ?)",
+        rows,
+    )
+    raw.commit()
+    raw.close()
+    return path
+
+
+def test_backfill_runs_even_though_the_column_already_exists():
+    """The real CI shape: column present, backfill still needed.
+
+    Regression test for a bug that shipped: the backfill hung off the
+    ``ALTER TABLE`` branch, which never runs in CI, so ``silent_count`` sat at
+    1 while ``error_count`` was 12 and the lecture kept being retried every
+    night — a full 3.4 GiB download each time.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Database(_modern_db(
+            tmp, [("671279", 12, 0, "silent_audio", _SPARSE_MSG)],
+        ))
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
+        ).fetchone()["silent_count"] == 12
+        assert d.get_unprocessed_lectures() == []
+        d.conn.close()
+
+
+def test_backfill_does_not_clobber_a_maintained_counter():
+    """Once silent attempts are being counted, error_count must not win."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Database(_modern_db(
+            tmp, [("671279", 12, 3, "silent_audio", _SPARSE_MSG)],
+        ))
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
+        ).fetchone()["silent_count"] == 3
+        d.conn.close()
+
+
+def test_backfill_ignores_a_row_with_no_attempts():
+    """A fresh row must not be given a budget it never spent."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Database(_modern_db(
+            tmp, [("671279", 0, 0, "silent_audio", _SPARSE_MSG)],
+        ))
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
+        ).fetchone()["silent_count"] == 0
         d.conn.close()
