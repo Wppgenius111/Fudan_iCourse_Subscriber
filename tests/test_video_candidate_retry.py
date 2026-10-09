@@ -57,6 +57,7 @@ class FakeReporter:
 class FakeDB:
     def __init__(self):
         self.errors: list[tuple[str, str]] = []
+        self.silent_errors: list[tuple[str, str]] = []
         self.processed: list[str] = []
         self.transcripts: list[str] = []
         self.summaries: list[str] = []
@@ -66,6 +67,9 @@ class FakeDB:
 
     def update_error(self, sub_id, stage, message):
         self.errors.append((sub_id, stage))
+
+    def update_silent_audio_error(self, sub_id, message):
+        self.silent_errors.append((sub_id, message))
 
     def clear_error(self, sub_id):
         pass
@@ -198,7 +202,12 @@ def test_single_candidate_still_skips_without_retrying():
     assert run(r) is None
     assert r.attempts == [SUB_ID]
     assert r._client.advances == 0
-    assert r._db.errors == [(SUB_ID, "transcribe")]
+    # Recorded on the *silent* counter, not the generic one — that is what
+    # gives this failure its own, shorter retry ceiling.
+    assert len(r._db.silent_errors) == 1
+    assert r._db.silent_errors[0][0] == SUB_ID
+    assert "chars of speech" in r._db.silent_errors[0][1]
+    assert r._db.errors == []
     assert any("[SKIP]" in line for line in r._reporter.lines)
 
 
@@ -208,7 +217,8 @@ def test_all_candidates_silent_gives_up_after_the_last_one():
     assert r.attempts == [SUB_ID, SUB_ID]
     assert r._client.advances == 1
     # Exactly one error recorded for the whole lecture, not one per attempt.
-    assert r._db.errors == [(SUB_ID, "transcribe")]
+    assert len(r._db.silent_errors) == 1
+    assert r._db.errors == []
 
 
 def test_the_loop_is_bounded():
@@ -265,6 +275,7 @@ def test_silent_then_other_skip_records_only_the_other_reason():
     assert r.attempts == [SUB_ID, SUB_ID]
     assert r._client.advances == 1
     assert r._db.errors == []
+    assert r._db.silent_errors == []
     assert not any("Recording not generated yet" in ln
                    for ln in r._reporter.lines)
 
