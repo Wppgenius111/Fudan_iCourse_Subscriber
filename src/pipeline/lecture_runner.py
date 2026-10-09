@@ -169,12 +169,17 @@ class LectureRunner:
             # Every candidate we were allowed to try came back silent.
             # Persisting a near-empty transcript would mark the lecture
             # processed and the real summary would never be produced, so
-            # record the error and let a later run pick it up.
+            # record the error and let a later run pick it up — but on its
+            # own, shorter leash: each attempt costs a full download, and a
+            # silent recording is usually the school's capture being broken
+            # rather than a recording that is merely late.
+            # ``update_silent_audio_error`` bumps ``silent_count`` so
+            # ``get_unprocessed_lectures`` parks the lecture after
+            # ``DEFAULT_MAX_SILENT_ERRORS`` runs.
             if tried > 1:
                 # More than one *different* file with no audio in it is no
                 # longer "the recording is still being generated" — the
-                # school's capture for this lecture is broken.  Say so, and
-                # let the error ceiling stop the retries.
+                # school's capture for this lecture is broken.  Say so.
                 self._reporter.info(
                     f"    [SKIP] All {tried} video candidates are silent — "
                     f"the recording looks broken at the source; will retry "
@@ -185,7 +190,7 @@ class LectureRunner:
                     f"    [SKIP] Recording not generated yet, will retry "
                     f"next run: {silent}"
                 )
-            self._db.update_error(sub_id, "transcribe", str(silent))
+            self._db.update_silent_audio_error(sub_id, str(silent))
 
         if transcript is None:
             # Either the above, or _get_transcript already logged + persisted
