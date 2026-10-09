@@ -278,6 +278,36 @@ class Database:
     #: the global ceiling; only this one gets the short leash.
     SILENT_AUDIO_STAGE = "silent_audio"
 
+    def get_parked_sub_ids(self, course_id: str | None = None,
+                           max_errors: int | None = None,
+                           max_silent: int | None = None) -> set[str]:
+        """sub_ids whose failure budget is spent.
+
+        ``get_unprocessed_lectures`` already hides these, but that is only one
+        of the two ways a lecture reaches the work list.  ``main`` also builds
+        one straight from the course catalog, keeping every lecture with
+        playback that has never been processed — and a lecture whose recording
+        is permanently broken never *is* processed, so it comes back as "new"
+        every single night, bypassing both ceilings entirely.  This is what
+        the ceilings have to be checked against.
+        """
+        if max_errors is None:
+            max_errors = self.DEFAULT_MAX_ERRORS
+        if max_silent is None:
+            max_silent = self.DEFAULT_MAX_SILENT_ERRORS
+        query = (
+            "SELECT sub_id FROM lectures"
+            " WHERE (COALESCE(error_count, 0) >= ?"
+            "        OR COALESCE(silent_count, 0) >= ?)"
+        )
+        params: tuple = (max_errors, max_silent)
+        if course_id:
+            query += " AND course_id = ?"
+            params = (max_errors, max_silent, course_id)
+        with self._lock:
+            rows = self.conn.execute(query, params).fetchall()
+        return {str(row["sub_id"]) for row in rows}
+
     def get_unprocessed_lectures(self, course_id: str | None = None,
                                   max_errors: int | None = None,
                                   max_silent: int | None = None) -> list[dict]:

@@ -402,3 +402,126 @@ def test_merge_db_carries_the_backfill_flag_across():
             ).fetchone() == ("1",)
         finally:
             remote.close()
+
+
+# ── the second door into the work list ───────────────────────────────────
+#
+# ``get_unprocessed_lectures`` is only one of the two ways a lecture reaches
+# the queue.  ``_enumerate_lectures`` also builds a list straight from the
+# course catalog, keeping every lecture that has playback and has never been
+# processed — and a lecture whose recording is permanently broken never *is*
+# processed, so it came back as "new" every single night, ceiling or no
+# ceiling.  Lecture 671279 did exactly that: parked on the database side for
+# weeks, yet still queued from the catalog side on run 37887219874.
+#
+# ``get_parked_sub_ids`` is the catalog-side half of the same two ceilings.
+
+class _SilentReporter:
+    """Stands in for ``Reporter`` — the enumeration only ever prints."""
+
+    def course_header(self, *a, **kw): pass
+    def course_dedup_skip(self, *a, **kw): pass
+    def course_new_count(self, *a, **kw): pass
+    def course_enumeration_error(self, *a, **kw): pass
+
+
+def test_parked_ids_lists_a_row_at_the_silent_ceiling(db):
+    _add(db, "671279", error_count=7, silent_count=7, error_stage="silent_audio")
+    assert db.get_parked_sub_ids() == {"671279"}
+
+
+def test_parked_ids_lists_a_row_at_the_global_ceiling(db):
+    _add(db, "111111", error_count=30, silent_count=0, error_stage="transcribe")
+    assert db.get_parked_sub_ids() == {"111111"}
+
+
+def test_parked_ids_ignores_a_row_still_under_both_ceilings(db):
+    _add(db, "222222", error_count=6, silent_count=6, error_stage="silent_audio")
+    assert db.get_parked_sub_ids() == set()
+
+
+def test_parked_ids_ignores_a_healthy_row(db):
+    _add(db, "333333", processed_at="2026-09-30T12:00:00")
+    assert db.get_parked_sub_ids() == set()
+
+
+def test_parked_ids_and_unprocessed_are_exact_complements(db):
+    """Whatever one hides, the other has to keep out, or a lecture leaks.
+
+    The two queries spell the same ceilings in opposite directions (``<``
+    against ``>=``).  If they drift apart a lecture can be simultaneously
+    "parked" and "unprocessed", and which one wins depends on which code
+    path it happens to take — which is precisely the shape of the bug.
+    """
+    _add(db, "under", error_count=6, silent_count=6, error_stage="silent_audio")
+    _add(db, "at_silent", error_count=7, silent_count=7,
+         error_stage="silent_audio")
+    _add(db, "at_global", error_count=30, silent_count=0,
+         error_stage="transcribe")
+
+    parked = db.get_parked_sub_ids()
+    unprocessed = _ids(db)
+    assert parked == {"at_silent", "at_global"}
+    assert unprocessed == {"under"}
+    assert parked & unprocessed == set()
+
+
+def test_parked_ids_respects_the_course_filter(db):
+    _add(db, "38678-parked", silent_count=7, error_stage="silent_audio")
+    with db.conn:
+        db.conn.execute(
+            "INSERT INTO lectures (sub_id, course_id, silent_count,"
+            " error_stage) VALUES ('99999-parked', '99999', 7, 'silent_audio')"
+        )
+    assert db.get_parked_sub_ids("38678") == {"38678-parked"}
+    assert db.get_parked_sub_ids() == {"38678-parked", "99999-parked"}
+
+
+def test_parked_ids_accepts_explicit_ceilings(db):
+    _add(db, "444444", error_count=3, silent_count=3, error_stage="silent_audio")
+    assert db.get_parked_sub_ids() == set()
+    assert db.get_parked_sub_ids(max_silent=3) == {"444444"}
+
+
+def test_a_parked_lecture_never_enters_the_work_list(db, monkeypatch):
+    """The regression itself, at the level it actually happened.
+
+    671279 has playback, has no ``processed_at``, and is permanently
+    silent.  The catalog list re-admitted it every night even though the
+    database had long since given up on it.
+    """
+    import main as main_mod
+    from src.runtime import config as config_mod
+
+    _add(db, "671279", error_count=14, silent_count=14,
+         error_stage="silent_audio")
+    _add(db, "777777", processed_at="2026-09-30T12:00:00")
+
+    class _FakeClient:
+        def get_course_detail(self, course_id):
+            return {
+                "title": "复杂系统理论及其在脑科学中的应用",
+                "teacher": "某老师",
+                "lectures": [
+                    # permanently silent, never processed → the trap
+                    {"sub_id": "671279", "sub_title": "第3-5节",
+                     "date": "2026-09-30", "has_playback": True},
+                    # already summarised → hidden by known_processed
+                    {"sub_id": "777777", "sub_title": "第1-2节",
+                     "date": "2026-09-23", "has_playback": True},
+                    # genuinely new → must still be processed
+                    {"sub_id": "888888", "sub_title": "第6-8节",
+                     "date": "2026-10-07", "has_playback": True},
+                    # no playback → never queued
+                    {"sub_id": "999999", "sub_title": "第9-10节",
+                     "date": "2026-10-14", "has_playback": False},
+                ],
+            }
+
+    monkeypatch.setattr(config_mod, "COURSE_IDS", ["38678"])
+    monkeypatch.setattr(main_mod, "_check_session", lambda client: None)
+
+    work = main_mod._enumerate_lectures(
+        _FakeClient(), db, _SilentReporter(),
+    )
+    assert [str(lec["sub_id"]) for _, _, lec in work] == ["888888"]

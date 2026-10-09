@@ -113,10 +113,17 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
             lectures = deduped
 
             known_processed = db.get_processed_sub_ids(course_id)
+            # A lecture that has burned through its failure budget must stay
+            # out of the work list even though it has never been processed —
+            # otherwise a permanently broken recording is re-downloaded every
+            # night.  The ceilings live in Database; this is the catalog-side
+            # half of them.
+            parked = db.get_parked_sub_ids(course_id)
             new_lectures = [
                 lec for lec in lectures
                 if lec.get("has_playback")
                 and str(lec["sub_id"]) not in known_processed
+                and str(lec["sub_id"]) not in parked
             ]
             unprocessed = db.get_unprocessed_lectures(course_id)
             new_ids = {str(lec["sub_id"]) for lec in new_lectures}
