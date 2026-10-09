@@ -19,7 +19,10 @@ log greps):
      completeness-checked) → ASR.  For ASR, ``Scheduler.audio_downloader
      .get`` blocks for the ffmpeg spawn scheduled earlier, then
      ``Transcriber.transcribe_tail`` reads PCM from the disk file with
-     tail-f semantics while ffmpeg keeps writing.
+     tail-f semantics while ffmpeg keeps writing.  A *complete* download
+     with an empty audio track is retried against the lecture's other
+     ``video_list`` candidates (see ``MAX_VIDEO_CANDIDATE_TRIES``) before
+     it is recorded as a failure.
   E  ``handle.drain()`` submits the deferred OCR jobs and blocks for them.
   E2 ``PPTPipeline.prefetch_and_ocr`` spawns a background thread that
      collects + dedups + OCRs the next lecture's pages, overlapping with
@@ -56,6 +59,15 @@ if TYPE_CHECKING:
     from src.runtime.scheduler import Scheduler
     from src.ai.summarizer import Summarizer
     from src.ai.transcriber import Transcriber
+
+
+#: Upper bound on how many of a lecture's MP4 candidates Phase D will try.
+#: A safety net rather than the real limit — ``ICourseClient
+#: .try_next_video_candidate`` returns False once the list is exhausted, and
+#: iCourse has never been seen to expose more than a couple.  Each extra
+#: attempt costs one more download of the whole lecture, which is why this
+#: stays small.
+MAX_VIDEO_CANDIDATE_TRIES = 3
 
 
 class LectureRunner:
@@ -122,15 +134,52 @@ class LectureRunner:
         self._schedule_next(next_info)
 
         # ── Phase D — ASR transcription ────────────────────────────────
-        transcript, transcript_segments = self._get_transcript(
-            existing, course_id, sub_id,
-        )
+        # A lecture can expose several MP4s and they are not interchangeable:
+        # 671279 downloaded *completely* from ``video_list[0]`` on nine
+        # consecutive nights and its audio track was empty every time.  So
+        # when a complete download turns out to be silent, try its sibling
+        # before recording a failure.  The extra attempt costs one more
+        # download of the same lecture, on a path that was already broken.
+        transcript = transcript_segments = None
+        silent: SparseAudioError | None = None
+        for attempt in range(MAX_VIDEO_CANDIDATE_TRIES):
+            try:
+                transcript, transcript_segments = self._get_transcript(
+                    existing, course_id, sub_id,
+                )
+                # The attempt ran to completion, whatever it returned — so
+                # the silent error below is not ours to record.  A later
+                # attempt can return None for its own reason (no video URL,
+                # timeout, truncated download) and has already persisted it.
+                silent = None
+                break
+            except SparseAudioError as e:
+                silent = e
+                if self._client.try_next_video_candidate(sub_id):
+                    self._reporter.info(
+                        f"    [Retry] {sub_id}: candidate #{attempt} held no "
+                        f"speech — trying the next video candidate"
+                    )
+                    continue
+                break
+
+        if transcript is None and silent is not None:
+            # Every candidate we were allowed to try came back silent.
+            # Persisting a near-empty transcript would mark the lecture
+            # processed and the real summary would never be produced, so
+            # record the error and let a later run pick it up.
+            self._reporter.info(
+                f"    [SKIP] Recording not generated yet, will retry next "
+                f"run: {silent}"
+            )
+            self._db.update_error(sub_id, "transcribe", str(silent))
+
         if transcript is None:
-            # _get_transcript already logged + persisted the skip reason.
-            # Still drain the PPT handle: with defer_ocr the OCR jobs are
-            # only submitted at drain() time, so skipping it would leave
-            # the pages 'pending' forever and force the retry run to redo
-            # download + dedup from scratch.
+            # Either the above, or _get_transcript already logged + persisted
+            # its own skip reason.  Still drain the PPT handle: with defer_ocr
+            # the OCR jobs are only submitted at drain() time, so skipping it
+            # would leave the pages 'pending' forever and force the retry run
+            # to redo download + dedup from scratch.
             ppt_handle.drain()
             return None
 
@@ -347,20 +396,15 @@ class LectureRunner:
             self._db.update_error(sub_id, "transcribe", str(e))
             self._release_audio(sub_id)
             return None, None
-        except SparseAudioError as e:
-            # The download was complete but the recording holds almost no
-            # speech — iCourse publishes a lecture's media as soon as the
-            # class starts, so this run overlapped the class.  Persisting the
-            # near-empty transcript would mark the lecture processed and the
-            # real summary would never be produced; record the error instead
-            # so a later run picks it up once the recording is filled in.
-            self._reporter.info(
-                f"    [SKIP] Recording not generated yet, will retry next "
-                f"run: {e}"
-            )
-            self._db.update_error(sub_id, "transcribe", str(e))
+        except SparseAudioError:
+            # A *complete* download whose audio track is empty.  Two very
+            # different causes look identical from here: the run overlapped
+            # the class (iCourse publishes a lecture's media the moment it
+            # starts), or we picked the wrong MP4 out of several.  Only the
+            # caller knows whether another candidate is worth a try, so
+            # release the download slot and let it decide.
             self._release_audio(sub_id)
-            return None, None
+            raise
         except Exception as e:
             self._reporter.info(
                 f"    [FAIL] Transcription error: {type(e).__name__}: {e}"
