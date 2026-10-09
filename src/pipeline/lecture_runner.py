@@ -142,7 +142,9 @@ class LectureRunner:
         # download of the same lecture, on a path that was already broken.
         transcript = transcript_segments = None
         silent: SparseAudioError | None = None
+        tried = 0
         for attempt in range(MAX_VIDEO_CANDIDATE_TRIES):
+            tried = attempt + 1
             try:
                 transcript, transcript_segments = self._get_transcript(
                     existing, course_id, sub_id,
@@ -168,10 +170,21 @@ class LectureRunner:
             # Persisting a near-empty transcript would mark the lecture
             # processed and the real summary would never be produced, so
             # record the error and let a later run pick it up.
-            self._reporter.info(
-                f"    [SKIP] Recording not generated yet, will retry next "
-                f"run: {silent}"
-            )
+            if tried > 1:
+                # More than one *different* file with no audio in it is no
+                # longer "the recording is still being generated" — the
+                # school's capture for this lecture is broken.  Say so, and
+                # let the error ceiling stop the retries.
+                self._reporter.info(
+                    f"    [SKIP] All {tried} video candidates are silent — "
+                    f"the recording looks broken at the source; will retry "
+                    f"next run: {silent}"
+                )
+            else:
+                self._reporter.info(
+                    f"    [SKIP] Recording not generated yet, will retry "
+                    f"next run: {silent}"
+                )
             self._db.update_error(sub_id, "transcribe", str(silent))
 
         if transcript is None:
@@ -403,6 +416,13 @@ class LectureRunner:
             # starts), or we picked the wrong MP4 out of several.  Only the
             # caller knows whether another candidate is worth a try, so
             # release the download slot and let it decide.
+            #
+            # Dump ffmpeg's own view first — if the file turns out to hold
+            # more than one audio stream, the silence may just be the wrong
+            # one of them (ffmpeg picks the "best" stream on its own and a
+            # ``-map`` would override that).  This is the last cheap
+            # explanation left once every candidate has come back silent.
+            self._dump_audio_diag(sub_id, handle)
             self._release_audio(sub_id)
             raise
         except Exception as e:
