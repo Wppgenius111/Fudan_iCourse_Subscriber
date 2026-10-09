@@ -544,21 +544,40 @@ class ICourseClient:
             for _k, _u in candidates:
                 _p = urlparse(_u)
                 print(f"      [{_k}] {_p.netloc}{_p.path}", flush=True)
-            # Also dump the *shape* of each candidate dict: a field like
-            # audioUrl / duration would let us skip the 2.7 GB video
-            # entirely.  Only keys and URL host+path are printed.
-            if isinstance(video_list, dict):
-                for _k, _v in video_list.items():
-                    if not isinstance(_v, dict):
-                        continue
-                    _keys = sorted(_v.keys())
-                    print(f"      [{_k}] keys={_keys}", flush=True)
-                    for _f in _keys:
-                        _val = _v[_f]
-                        if isinstance(_val, str) and ".mp4" in _val:
-                            _p2 = urlparse(_val)
-                            print(f"      [{_k}].{_f} = "
-                                  f"{_p2.netloc}{_p2.path}", flush=True)
+            # Dump the fields that could *discriminate* between candidates.
+            #
+            # Observed key set (2026-10-09): created_at, duration,
+            # iva_source_id, now, play_msg, preview_url, resource_guid,
+            # status, temp_preivew_url, thumb, time_offset, type.
+            #
+            # ``duration`` / ``status`` / ``created_at`` are the ones that
+            # matter: when a lecture exposes both an entry that is still
+            # transcoding and the finished recording, those differ.  They are
+            # also the only way to pick the right MP4 without downloading
+            # 2.1 GB and listening to silence.  ``resource_guid`` and
+            # ``iva_source_id`` are internal ids already implied by the path
+            # hash, so they stay out of a public log; URLs are host+path only.
+            for _k, _v in (video_list.items()
+                           if isinstance(video_list, dict) else ()):
+                if not isinstance(_v, dict):
+                    continue
+                print(f"      [{_k}] keys={sorted(_v.keys())}", flush=True)
+                _bits = [
+                    f"{_f}={_v[_f]!r}"
+                    for _f in ("duration", "status", "created_at",
+                               "time_offset", "type")
+                    if _f in _v
+                ]
+                _msg = _v.get("play_msg")
+                if _msg:
+                    _bits.append(f"play_msg={str(_msg)[:60]!r}")
+                print(f"      [{_k}] {' '.join(_bits)}", flush=True)
+                for _f in ("temp_preivew_url",):
+                    _val = _v.get(_f)
+                    if isinstance(_val, str) and _val:
+                        _p2 = urlparse(_val)
+                        print(f"      [{_k}].{_f} = "
+                              f"{_p2.netloc}{_p2.path}", flush=True)
 
         # Fallback: try playurl dict (has /0/ prefix, may need stripping)
         if not base_url:
