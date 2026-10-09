@@ -194,3 +194,69 @@ def test_no_url_at_all_reports_and_returns_none(capsys):
     c = make_client({"now": 1700000000, "video_list": {}})
     assert c.get_video_url("1", "888", verbose=False) is None
     assert "No video URL found for 888" in capsys.readouterr().out
+
+
+# ── 5. The per-candidate metadata that could break the tie ──────────────
+
+def test_candidate_metadata_is_dumped(capsys):
+    """A lecture with two MP4s must report the fields that tell them apart.
+
+    Observed live on 2026-10-09: lecture 671279 exposed two different
+    ``preview_url`` files and the code silently took the first one, which
+    turned out to be a full-length container with a silent audio track.
+    ``duration`` / ``status`` / ``created_at`` are what a fix would key on,
+    so they have to be visible in the log.
+    """
+    c = make_client({
+        "now": 1700000000,
+        "video_list": {
+            "0": {
+                "preview_url": "https://cdn.example/silent/0.mp4",
+                "duration": "9760", "status": "2",
+                "created_at": "2026-09-30 09:55:00",
+                "play_msg": "视频未到开放时间",
+                "time_offset": "0", "type": "1",
+            },
+            "1": {
+                "preview_url": "https://cdn.example/real/0.mp4",
+                "duration": "9760", "status": "3",
+                "created_at": "2026-09-30 13:02:00",
+            },
+        },
+    })
+    c.get_video_url("1", "999", verbose=False)
+    out = capsys.readouterr().out
+    assert "duration='9760'" in out
+    assert "status='2'" in out and "status='3'" in out
+    assert "created_at='2026-09-30 13:02:00'" in out
+    assert "play_msg='视频未到开放时间'" in out
+
+
+def test_candidate_metadata_stays_within_one_report(capsys):
+    c = make_client({
+        "now": 1700000000,
+        "video_list": {
+            "0": {"preview_url": "https://cdn.example/a.mp4", "duration": "1"},
+            "1": {"preview_url": "https://cdn.example/b.mp4", "duration": "2"},
+        },
+    })
+    for _ in range(3):
+        c.get_video_url("1", "999", verbose=False)
+    assert capsys.readouterr().out.count("duration=") == 2
+
+
+def test_internal_ids_are_not_logged(capsys):
+    """resource_guid / iva_source_id stay out of a public log."""
+    c = make_client({
+        "now": 1700000000,
+        "video_list": {
+            "0": {"preview_url": "https://cdn.example/a.mp4",
+                  "resource_guid": "GUID-AAAA", "iva_source_id": "IVA-BBBB"},
+            "1": {"preview_url": "https://cdn.example/b.mp4",
+                  "resource_guid": "GUID-CCCC", "iva_source_id": "IVA-DDDD"},
+        },
+    })
+    c.get_video_url("1", "999", verbose=False)
+    out = capsys.readouterr().out
+    assert "GUID-" not in out
+    assert "IVA-" not in out
