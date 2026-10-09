@@ -73,6 +73,15 @@ class Database:
     #: below.
     _SPARSE_MSG_MARKER = "%chars/min%"
 
+    #: ``meta`` key recording that the backfill below has been applied.
+    #:
+    #: Kept in the database rather than in memory: the CI runner rebuilds the
+    #: database from the data branch on every run, so anything remembered only
+    #: in the process is gone by the next night.  ``merge_db`` carries unknown
+    #: ``meta`` keys across when it merges the local database into the remote
+    #: one, which is what makes the flag survive the shard round-trip.
+    BACKFILL_FLAG_KEY = "silent_count_backfilled"
+
     def _backfill_silent_count(self):
         """Seed ``silent_count`` from the failures already on record.
 
@@ -80,34 +89,40 @@ class Database:
         already burned a dozen runs gets handed another seven before
         ``silent_count`` reaches its ceiling — the opposite of the point.
         ``error_count`` is the only record of how many times the lecture has
-        been tried, so copy it across for the rows whose last failure was a
-        sparse-audio one.
+        been tried, so raise ``silent_count`` to it for the rows whose last
+        failure was a sparse-audio one.
 
         Matches ``error_stage = 'transcribe'`` as well as the new
         ``silent_audio``: rows written before this change carry the old stage
         name.
 
-        **Not** tied to the ``ALTER TABLE`` above.  ``sharder`` reassembles
-        the database from ``SCHEMA_SQL``, which already contains every
-        migration column, so by the time ``Database`` opens it the column is
-        always present and that branch never fires — keying the backfill off
-        it meant it never ran in CI at all.  (It did not: ``silent_count``
-        sat at 1 while ``error_count`` was 12.)
+        **Not** tied to the ``ALTER TABLE`` in ``_init_tables``.  ``sharder``
+        reassembles the database from ``SCHEMA_SQL``, which already contains
+        every migration column, so by the time ``Database`` opens it the
+        column is always present and that branch never fires — keying the
+        backfill off it meant it never ran in CI at all.
 
-        Instead the statement is written to be *naturally* idempotent:
-        ``COALESCE(silent_count, 0) = 0`` restricts it to rows that have never
-        recorded a silent attempt, and ``update_silent_audio_error`` leaves
-        that at 1 or more the moment one is recorded.  So it can safely run on
-        every startup — there is no flag to lose when the runner rebuilds the
-        database from the data branch each night.
+        The guard has to be a stored flag, not a condition on the counters.
+        An earlier attempt used ``COALESCE(silent_count, 0) = 0`` and quietly
+        excluded the very row it was written for: ``671279`` had already
+        recorded one silent attempt under the new code, so ``silent_count``
+        was 1 while ``error_count`` was 12.
         """
+        if self.conn.execute(
+            "SELECT 1 FROM meta WHERE key = ?", (self.BACKFILL_FLAG_KEY,)
+        ).fetchone():
+            return
         self.conn.execute(
-            "UPDATE lectures SET silent_count = error_count"
+            "UPDATE lectures"
+            " SET silent_count = MAX(COALESCE(silent_count, 0),"
+            "                        COALESCE(error_count, 0))"
             " WHERE error_stage IN (?, 'transcribe')"
-            "   AND error_msg LIKE ?"
-            "   AND COALESCE(silent_count, 0) = 0"
-            "   AND COALESCE(error_count, 0) > 0",
+            "   AND error_msg LIKE ?",
             (self.SILENT_AUDIO_STAGE, self._SPARSE_MSG_MARKER),
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, '1')",
+            (self.BACKFILL_FLAG_KEY,),
         )
 
     def write_meta(self, key: str, value: str):
