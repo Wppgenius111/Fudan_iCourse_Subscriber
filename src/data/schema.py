@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS lectures (
     processed_at TEXT, emailed_at TEXT,
     error_msg TEXT, error_count INTEGER DEFAULT 0,
     error_stage TEXT, summary_model TEXT,
+    silent_count INTEGER DEFAULT 0,
     FOREIGN KEY (course_id) REFERENCES courses(course_id)
 );
 CREATE TABLE IF NOT EXISTS ppt_pages (
@@ -71,6 +72,14 @@ CREATE TABLE IF NOT EXISTS meta (
 
 # Columns added to ``lectures`` after the v1 schema shipped.  Existing DBs
 # get them via ALTER TABLE in Database._init_tables / merge_db._ensure_schema.
+#
+# A column listed here MUST also appear in ``SCHEMA_SQL`` above.  These two
+# lists serve different readers: ``SCHEMA_SQL`` creates brand-new databases
+# (a fresh install, and every shard the sharder materializes), while this list
+# migrates databases that already exist.  ``_build_shard_db`` copies columns
+# straight off the source rows, so a column that is only in this list makes
+# every shard build fail with "table lectures has no column named ...".
+# ``tests/test_schema_consistency.py`` enforces the two stay in sync.
 LECTURES_MIGRATION_COLUMNS: list[tuple[str, str]] = [
     ("error_msg", "TEXT"),
     ("error_count", "INTEGER DEFAULT 0"),
