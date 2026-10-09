@@ -218,6 +218,28 @@ def test_the_loop_is_bounded():
     assert len(r.attempts) == MAX_VIDEO_CANDIDATE_TRIES
 
 
+def test_message_separates_pending_recording_from_broken_one():
+    """One silent candidate means "not ready"; all of them means "broken".
+
+    They call for different reactions from whoever reads the log, and the
+    second one is what the nine-night 671279 incident turned out to be: two
+    different files, both full length, neither with any audio.
+    """
+    single = make_runner(1, [silent()])
+    run(single)
+    assert any("Recording not generated yet" in ln
+               for ln in single._reporter.lines)
+    assert not any("candidates are silent" in ln
+                   for ln in single._reporter.lines)
+
+    both = make_runner(2, [silent(), silent(chars=0)])
+    run(both)
+    assert any("All 2 video candidates are silent" in ln
+               for ln in both._reporter.lines)
+    assert not any("Recording not generated yet" in ln
+                   for ln in both._reporter.lines)
+
+
 # ── 3. Other skip paths are untouched ────────────────────────────────────
 
 def test_non_sparse_skip_is_not_retried():
