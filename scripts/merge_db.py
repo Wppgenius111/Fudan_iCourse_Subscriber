@@ -76,10 +76,10 @@ def merge(local_path: str, remote_path: str):
                 INSERT OR IGNORE INTO main.lectures
                     (sub_id, course_id, sub_title, date, transcript, summary,
                      processed_at, emailed_at, error_msg, error_count, error_stage,
-                     summary_model)
+                     summary_model, silent_count)
                 SELECT sub_id, course_id, sub_title, date, transcript, summary,
                        processed_at, emailed_at, error_msg, error_count, error_stage,
-                       summary_model
+                       summary_model, silent_count
                 FROM local.lectures
             """)
 
@@ -107,6 +107,14 @@ def merge(local_path: str, remote_path: str):
                         WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
                         THEN NULL
                         ELSE COALESCE(l.error_stage, main.lectures.error_stage)
+                    END,
+                    -- Take the larger counter: it is a "how many times has
+                    -- this been tried" tally, and a stale remote copy must
+                    -- not reset the parking decision made by a fresher run.
+                    silent_count = CASE
+                        WHEN COALESCE(l.processed_at, main.lectures.processed_at) IS NOT NULL
+                        THEN 0
+                        ELSE MAX(COALESCE(l.silent_count, 0), COALESCE(main.lectures.silent_count, 0))
                     END
                 FROM local.lectures l
                 WHERE main.lectures.sub_id = l.sub_id
