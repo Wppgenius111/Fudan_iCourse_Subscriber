@@ -45,8 +45,12 @@ def make_client(info: dict, detail: dict | None = None) -> ICourseClient:
 
     Instance-attribute lambdas are *not* bound as methods, so each one is
     called with exactly the arguments spelled out here — no implicit self.
+    The candidate bookkeeping that ``__init__`` normally installs is set up
+    by hand because ``__new__`` skips ``__init__``.
     """
     c = ICourseClient.__new__(ICourseClient)
+    c._video_candidates = {}
+    c._video_pref = {}
     c.get_sub_info = lambda course_id, sub_id: info
     c.get_sub_detail = lambda course_id, sub_id: detail or {}
     c.sign_video_url = lambda base_url, now=None: base_url
