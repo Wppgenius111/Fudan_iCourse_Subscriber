@@ -50,6 +50,9 @@ jobs:
           db.row_factory = sqlite3.Row
           cols = {r[1] for r in db.execute("PRAGMA table_info(lectures)")}
           print("columns:", sorted(cols))
+          print("meta keys:", [
+              (r[0], r[1]) for r in db.execute("SELECT key, value FROM meta")
+          ])
           rows = [dict(r) for r in db.execute(
               "SELECT sub_id, course_id, date, error_count, silent_count,"
               " error_stage, error_msg, processed_at FROM lectures"
