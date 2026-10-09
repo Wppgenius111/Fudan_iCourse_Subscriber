@@ -200,14 +200,35 @@ class Database:
     #: investigated.
     DEFAULT_MAX_ERRORS = int(os.environ.get("FICS_MAX_ERRORS", "30"))
 
+    #: Separate, much lower ceiling for ``silent_count`` — attempts that ended
+    #: in "the download was complete but the recording holds no speech".
+    #:
+    #: This is deliberately not folded into ``DEFAULT_MAX_ERRORS``.  A silent
+    #: recording is usually not a transient condition: on 2026-09-30 one
+    #: lecture came back byte-identical (2130 MiB, 9760 s, 144 chars) on nine
+    #: consecutive nights, and both of its ``video_list`` candidates turned
+    #: out to have no audio at all.  Each of those attempts downloads the
+    #: whole MP4, so waiting the full 30 runs burns ~60 GiB of transfer for
+    #: nothing.  A week is long enough for a genuinely late recording to show
+    #: up, and after that the lecture is parked.
+    DEFAULT_MAX_SILENT_ERRORS = int(
+        os.environ.get("FICS_MAX_SILENT_ERRORS", "7"))
+
+    #: ``error_stage`` value recorded for the above, so the two ceilings can
+    #: be applied independently.  ``no_video`` and ``transcribe`` keep using
+    #: the global ceiling; only this one gets the short leash.
+    SILENT_AUDIO_STAGE = "silent_audio"
+
     def get_unprocessed_lectures(self, course_id: str | None = None,
-                                  max_errors: int | None = None) -> list[dict]:
+                                  max_errors: int | None = None,
+                                  max_silent: int | None = None) -> list[dict]:
         """Return lectures that need (re-)processing.
 
         Only returns lectures whose ``error_count`` is below *max_errors* —
         a permanently-failing lecture (e.g. ``get-sub-info`` RuntimeError
         for a removed recording) is abandoned after that many attempts
-        rather than clogging every workflow run.
+        rather than clogging every workflow run.  ``silent_count`` has its
+        own, lower ceiling; see ``DEFAULT_MAX_SILENT_ERRORS``.
 
         A lecture that was marked processed but whose ``summary`` is empty
         is also returned.  That combination means a summary was lost — the
@@ -223,6 +244,8 @@ class Database:
         """
         if max_errors is None:
             max_errors = self.DEFAULT_MAX_ERRORS
+        if max_silent is None:
+            max_silent = self.DEFAULT_MAX_SILENT_ERRORS
         # SQLite's one-argument TRIM() strips spaces only, so a summary of
         # "\n" or a lone tab would still compare non-empty.  Spell the
         # whitespace set out explicitly.
@@ -238,11 +261,12 @@ class Database:
             "   )"
             " )"
             "   AND (error_count IS NULL OR error_count < ?)"
+            "   AND (silent_count IS NULL OR silent_count < ?)"
         )
-        params: tuple = (max_errors,)
+        params: tuple = (max_errors, max_silent)
         if course_id:
             query += " AND course_id = ?"
-            params = (max_errors, course_id)
+            params = (max_errors, max_silent, course_id)
         with self._lock:
             rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
@@ -290,12 +314,31 @@ class Database:
                 (stage, error_msg, sub_id),
             )
 
+    def update_silent_audio_error(self, sub_id: str, error_msg: str):
+        """Record "complete download, no speech in it".
+
+        Counts toward *both* ceilings but bumps ``silent_count`` as well, so
+        ``get_unprocessed_lectures`` can park the lecture after
+        ``DEFAULT_MAX_SILENT_ERRORS`` attempts instead of waiting for the
+        global ceiling.  See that constant for why the two differ.
+        """
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE lectures
+                   SET error_stage = ?, error_msg = ?,
+                       error_count = COALESCE(error_count, 0) + 1,
+                       silent_count = COALESCE(silent_count, 0) + 1
+                   WHERE sub_id = ?""",
+                (self.SILENT_AUDIO_STAGE, error_msg, sub_id),
+            )
+
     def clear_error(self, sub_id: str):
         """Clear error state after successful processing."""
         with self._lock, self.conn:
             self.conn.execute(
                 """UPDATE lectures
-                   SET error_stage = NULL, error_msg = NULL, error_count = 0
+                   SET error_stage = NULL, error_msg = NULL, error_count = 0,
+                       silent_count = 0
                    WHERE sub_id = ?""",
                 (sub_id,),
             )
