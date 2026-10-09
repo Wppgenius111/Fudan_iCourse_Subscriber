@@ -53,8 +53,6 @@ class Database:
                     self.conn.execute(
                         f"ALTER TABLE lectures ADD COLUMN {col} {typedef}"
                     )
-                    if col == "silent_count":
-                        self._backfill_silent_count()
 
             existing_ppt = {
                 row[1]
@@ -68,29 +66,47 @@ class Database:
                         f"ALTER TABLE ppt_pages ADD COLUMN {col} {typedef}"
                     )
 
+            self._backfill_silent_count()
+
     #: Marker inside ``SparseAudioError``'s message — our own text, produced
-    #: by ``Transcriber._check_speech_density``.  Used only by the one-time
-    #: backfill below.
+    #: by ``Transcriber._check_speech_density``.  Used only by the backfill
+    #: below.
     _SPARSE_MSG_MARKER = "%chars/min%"
 
     def _backfill_silent_count(self):
         """Seed ``silent_count`` from the failures already on record.
 
-        Runs exactly once, right after the column is added.  Without it every
-        existing row starts at 0, so a lecture that has already burned ten
-        runs would be handed another seven before ``silent_count`` reached
-        its ceiling — the opposite of the point.  ``error_count`` is the only
-        record of how many times the lecture has been tried, so copy it for
-        the rows whose last failure was a sparse-audio one.
+        Without this every pre-existing row starts at 0, so a lecture that has
+        already burned a dozen runs gets handed another seven before
+        ``silent_count`` reaches its ceiling — the opposite of the point.
+        ``error_count`` is the only record of how many times the lecture has
+        been tried, so copy it across for the rows whose last failure was a
+        sparse-audio one.
 
         Matches ``error_stage = 'transcribe'`` as well as the new
-        ``silent_audio``: rows written before this change carry the old
-        stage name.
+        ``silent_audio``: rows written before this change carry the old stage
+        name.
+
+        **Not** tied to the ``ALTER TABLE`` above.  ``sharder`` reassembles
+        the database from ``SCHEMA_SQL``, which already contains every
+        migration column, so by the time ``Database`` opens it the column is
+        always present and that branch never fires — keying the backfill off
+        it meant it never ran in CI at all.  (It did not: ``silent_count``
+        sat at 1 while ``error_count`` was 12.)
+
+        Instead the statement is written to be *naturally* idempotent:
+        ``COALESCE(silent_count, 0) = 0`` restricts it to rows that have never
+        recorded a silent attempt, and ``update_silent_audio_error`` leaves
+        that at 1 or more the moment one is recorded.  So it can safely run on
+        every startup — there is no flag to lose when the runner rebuilds the
+        database from the data branch each night.
         """
         self.conn.execute(
             "UPDATE lectures SET silent_count = error_count"
             " WHERE error_stage IN (?, 'transcribe')"
-            "   AND error_msg LIKE ?",
+            "   AND error_msg LIKE ?"
+            "   AND COALESCE(silent_count, 0) = 0"
+            "   AND COALESCE(error_count, 0) > 0",
             (self.SILENT_AUDIO_STAGE, self._SPARSE_MSG_MARKER),
         )
 
