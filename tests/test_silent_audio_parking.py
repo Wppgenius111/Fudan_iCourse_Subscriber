@@ -176,3 +176,84 @@ def test_column_is_added_to_a_pre_existing_database():
 def test_the_stage_name_matches_the_frontend_contract(db):
     """frontend/js/db.js maps this exact string to the gray 'No Audio' badge."""
     assert Database.SILENT_AUDIO_STAGE == "silent_audio"
+
+
+# ── one-time backfill for the database already on the data branch ────────
+
+_SPARSE_MSG = ("9760s of audio (163 min) contains only 144 chars of speech "
+               "(0.9 chars/min, floor is 5). The recording is probably still "
+               "being generated.")
+
+
+def _legacy_db(tmp: str, rows: list[tuple]) -> str:
+    """A database shaped like the one on the data branch before this change."""
+    path = os.path.join(tmp, "legacy.db")
+    raw = sqlite3.connect(path)
+    raw.execute(
+        "CREATE TABLE lectures (sub_id TEXT PRIMARY KEY,"
+        " course_id TEXT NOT NULL, sub_title TEXT, date TEXT,"
+        " transcript TEXT, summary TEXT, processed_at TEXT,"
+        " emailed_at TEXT, error_msg TEXT,"
+        " error_count INTEGER DEFAULT 0, error_stage TEXT,"
+        " summary_model TEXT)"
+    )
+    raw.executemany(
+        "INSERT INTO lectures (sub_id, course_id, error_count, error_stage,"
+        " error_msg) VALUES (?, '38678', ?, ?, ?)",
+        rows,
+    )
+    raw.commit()
+    raw.close()
+    return path
+
+
+def test_backfill_parks_a_lecture_that_already_burned_ten_runs():
+    """The 671279 case: ten failures on record, all of them silent."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Database(_legacy_db(tmp, [("671279", 10, "transcribe", _SPARSE_MSG)]))
+        row = d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
+        ).fetchone()
+        assert row["silent_count"] == 10
+        assert d.get_unprocessed_lectures() == []
+        d.conn.close()
+
+
+def test_backfill_leaves_other_failures_alone():
+    """A truncated download is not a silent recording; keep its full budget."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Database(_legacy_db(tmp, [
+            ("100001", 10, "transcribe", "download came up short at 41%"),
+            ("100002", 10, "no_video", "no playable video URL"),
+            ("100003", 10, "transcribe", _SPARSE_MSG),
+        ]))
+        rows = {r["sub_id"]: r for r in d.get_unprocessed_lectures()}
+        # The two non-sparse rows keep their full 30-run budget...
+        assert rows["100001"]["silent_count"] == 0
+        assert rows["100002"]["silent_count"] == 0
+        # ...and the sparse one is parked, so it is not in the list at all.
+        assert "100003" not in rows
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '100003'"
+        ).fetchone()["silent_count"] == 10
+        d.conn.close()
+
+
+def test_backfill_runs_only_once():
+    """Reopening the database must not re-copy error_count over a reset."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _legacy_db(tmp, [("671279", 10, "transcribe", _SPARSE_MSG)])
+        d = Database(path)
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
+        ).fetchone()["silent_count"] == 10
+        d.conn.close()
+
+        # A later run retries once more and records it on the silent counter;
+        # reopening must not snap silent_count back up to error_count.
+        d = Database(path)
+        d.update_silent_audio_error("671279", _SPARSE_MSG)
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
+        ).fetchone()["silent_count"] == 11
+        d.conn.close()
