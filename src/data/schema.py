@@ -76,6 +76,11 @@ LECTURES_MIGRATION_COLUMNS: list[tuple[str, str]] = [
     ("error_count", "INTEGER DEFAULT 0"),
     ("error_stage", "TEXT"),
     ("summary_model", "TEXT"),
+    # Attempts that ended in "complete download, no speech in it".  Kept
+    # apart from ``error_count`` so it can have its own, much lower ceiling:
+    # a silent recording is almost always the school's capture being broken,
+    # and retrying it costs a full 1-2 GiB download every single run.
+    ("silent_count", "INTEGER DEFAULT 0"),
 ]
 
 # Columns added to ``ppt_pages`` after its initial shape shipped.
