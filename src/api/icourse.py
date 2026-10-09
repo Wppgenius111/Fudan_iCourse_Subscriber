@@ -66,6 +66,14 @@ class ICourseClient:
         self.vpn = vpn_session
         self.base_url = config.ICOURSE_BASE
         self._userinfo = None
+        #: sub_id -> every ``.mp4`` that ``video_list`` exposed for that
+        #: lecture, in server order.  Filled in as a side effect of
+        #: ``get_video_url`` so the caller can retry against the next one —
+        #: see ``try_next_video_candidate``.
+        self._video_candidates: dict[str, list[str]] = {}
+        #: sub_id -> index into the above that ``get_video_url`` should use.
+        #: Advanced only by ``try_next_video_candidate``.
+        self._video_pref: dict[str, int] = {}
 
     def get_userinfo(self) -> dict:
         """Get current user info (id, tenant_id, phone, account).
@@ -519,9 +527,25 @@ class ICourseClient:
                     preview = v.get("preview_url")
                     if preview and preview.endswith(".mp4"):
                         candidates.append((str(k), preview))
-                        if base_url is None:
-                            base_url = preview
-                            source = f"video_list[{k}].preview_url"
+
+        # Remember every candidate, then take the one currently preferred.
+        # Server order is not a quality order: lecture 671279 exposed two
+        # files whose durations differed by 12 s, and the first one
+        # downloaded completely — full length, full byte count — with a
+        # silent audio track.  Recording the list lets the caller retry the
+        # sibling instead of giving up (see try_next_video_candidate).
+        cand_idx = 0
+        if candidates:
+            sub_key = str(sub_id)
+            self._video_candidates[sub_key] = [u for _, u in candidates]
+            cand_idx = min(self._video_pref.get(sub_key, 0),
+                           len(candidates) - 1)
+            _k, base_url = candidates[cand_idx]
+            source = f"video_list[{_k}].preview_url"
+
+        # Diagnostics are keyed per (sub_id, candidate) so a retry against a
+        # different candidate is reported again rather than suppressed.
+        report_key = f"{sub_id}#{cand_idx}"
 
         # Diagnostic only: log host+path of every candidate (never the query
         # string — it may carry a signature token).  Upstream issue #44 showed
@@ -537,10 +561,11 @@ class ICourseClient:
         # request.
         ambiguous = len(candidates) > 1 or not candidates
         if (verbose or ambiguous) \
-                and (sub_id, "candidates") not in _VIDEO_SOURCE_REPORTED:
-            _VIDEO_SOURCE_REPORTED.add((sub_id, "candidates"))
+                and (report_key, "candidates") not in _VIDEO_SOURCE_REPORTED:
+            _VIDEO_SOURCE_REPORTED.add((report_key, "candidates"))
             print(f"    [VideoDiag] {sub_id}: video_list exposes "
-                  f"{len(candidates)} .mp4 candidate(s)", flush=True)
+                  f"{len(candidates)} .mp4 candidate(s), using #{cand_idx}",
+                  flush=True)
             for _k, _u in candidates:
                 _p = urlparse(_u)
                 print(f"      [{_k}] {_p.netloc}{_p.path}", flush=True)
@@ -626,11 +651,41 @@ class ICourseClient:
         # Unlike the landscape dump above this is always emitted — it is a
         # single line, and it is the line that matters.  Same self-guard:
         # on the hot path this method is called once per HTTP request.
-        if (sub_id, "picked") not in _VIDEO_SOURCE_REPORTED:
-            _VIDEO_SOURCE_REPORTED.add((sub_id, "picked"))
+        if (report_key, "picked") not in _VIDEO_SOURCE_REPORTED:
+            _VIDEO_SOURCE_REPORTED.add((report_key, "picked"))
             print(f"    [VideoSource] {sub_id}: {source}", flush=True)
 
         return self.sign_video_url(base_url, now=now)
+
+    def try_next_video_candidate(self, sub_id: str) -> bool:
+        """Advance ``sub_id`` to the next ``video_list`` MP4.
+
+        Returns False when there is no further candidate, so the caller can
+        use this directly as a retry-loop condition.
+
+        Why this exists: a lecture can expose several MP4s (upstream issue
+        #44) and they are not interchangeable.  Lecture 671279 offered two
+        files whose durations differed by 12 s; the first one downloaded
+        *completely* — full length, full byte count — yet its audio track was
+        silent, and the identical result repeated on nine consecutive nights.
+        Metadata could not tell the two apart (same ``status``, same
+        ``play_msg``, ``created_at`` two seconds apart, only ``type``
+        differed), so the only honest way to choose is to try the sibling.
+
+        ``get_video_url`` reports which candidate it used, so the retry is
+        visible in the log.
+        """
+        sub_key = str(sub_id)
+        urls = self._video_candidates.get(sub_key) or []
+        nxt = self._video_pref.get(sub_key, 0) + 1
+        if nxt >= len(urls):
+            return False
+        self._video_pref[sub_key] = nxt
+        return True
+
+    def video_candidate_count(self, sub_id: str) -> int:
+        """How many MP4s ``video_list`` exposed the last time we looked."""
+        return len(self._video_candidates.get(str(sub_id)) or [])
 
     def get_stream_params(self, video_url: str) -> tuple[str, str]:
         """Get WebVPN URL and HTTP headers for direct streaming (e.g., ffmpeg).
