@@ -305,7 +305,7 @@
                   :class="{
                     'badge-ready': lec.state === 'ready',
                     'badge-processing': lec.state === 'processing',
-                    'badge-waiting': lec.state === 'waiting' || lec.state === 'novideo',
+                    'badge-waiting': lec.state === 'waiting' || lec.state === 'novideo' || lec.state === 'silent',
                     'badge-skipped': lec.state === 'skipped',
                     'badge-failed': lec.state === 'failed'
                   }"
@@ -313,6 +313,7 @@
                           lec.state === 'processing' ? 'Summarizing…' :
                           lec.state === 'waiting' ? 'Waiting' :
                           lec.state === 'novideo' ? 'No Video' :
+                          lec.state === 'silent' ? 'No Audio' :
                           lec.state === 'skipped' ? 'No Content' :
                           'Failed: ' + (lec.error_stage || 'unknown')"></span>
           </div>
