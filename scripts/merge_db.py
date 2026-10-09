@@ -163,6 +163,23 @@ def merge(local_path: str, remote_path: str):
                 """)
 
     finally:
+        # Carry over ``meta`` keys the CI does not own.  The runner writes
+        # bookkeeping there that has to outlive the run — e.g. the one-time
+        # ``silent_count`` backfill flag, which is what stops the backfill
+        # re-running (and re-inflating the counters) on the next night.
+        # ``INSERT OR IGNORE`` keeps whatever the remote already has, so this
+        # cannot clobber state another run owns.  Guarded because a local
+        # database predating the ``meta`` table has nothing to contribute.
+        has_meta = conn.execute(
+            "SELECT 1 FROM local.sqlite_master "
+            "WHERE type='table' AND name='meta'"
+        ).fetchone()
+        if has_meta:
+            conn.execute("""
+                INSERT OR IGNORE INTO main.meta (key, value)
+                SELECT key, value FROM local.meta
+            """)
+
         # Persist COURSE_IDS from the CI secret into the meta table so
         # the frontend can read the current subscription list from the
         # metadata shard without relying on localStorage alone.
@@ -172,7 +189,7 @@ def merge(local_path: str, remote_path: str):
                 "INSERT OR REPLACE INTO meta (key, value) "
                 "VALUES ('course_ids', ?)", (course_ids_env,),
             )
-            conn.commit()
+        conn.commit()
 
         try:
             conn.execute("DETACH DATABASE local")
