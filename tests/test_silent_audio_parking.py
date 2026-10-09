@@ -17,6 +17,7 @@ instead of costing a download every night.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sqlite3
 import sys
@@ -28,6 +29,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.database import Database  # noqa: E402
 from src.data.schema import SCHEMA_SQL  # noqa: E402
+
+# ``scripts/`` is not a package, so load merge_db by path.
+_spec = importlib.util.spec_from_file_location(
+    "merge_db",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts", "merge_db.py",
+    ),
+)
+merge_db = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(merge_db)
 
 
 @pytest.fixture()
@@ -301,15 +313,20 @@ def test_backfill_runs_even_though_the_column_already_exists():
         d.conn.close()
 
 
-def test_backfill_does_not_clobber_a_maintained_counter():
-    """Once silent attempts are being counted, error_count must not win."""
+def test_backfill_raises_a_partially_counted_row_too():
+    """671279's exact shape: one silent attempt counted, eleven uncounted.
+
+    The previous attempt at this guard used ``COALESCE(silent_count, 0) = 0``
+    and so excluded this row — which is the one it existed for.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         d = Database(_modern_db(
-            tmp, [("671279", 12, 3, "silent_audio", _SPARSE_MSG)],
+            tmp, [("671279", 12, 1, "silent_audio", _SPARSE_MSG)],
         ))
         assert d.conn.execute(
             "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
-        ).fetchone()["silent_count"] == 3
+        ).fetchone()["silent_count"] == 12
+        assert d.get_unprocessed_lectures() == []
         d.conn.close()
 
 
@@ -323,3 +340,65 @@ def test_backfill_ignores_a_row_with_no_attempts():
             "SELECT silent_count FROM lectures WHERE sub_id = '671279'"
         ).fetchone()["silent_count"] == 0
         d.conn.close()
+
+
+def test_backfill_does_not_run_twice():
+    """The flag in ``meta`` is what makes it one-time, not a counter guard.
+
+    After the transition run the two counters evolve independently, so a later
+    ``error_count`` must not drag ``silent_count`` up with it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _modern_db(
+            tmp, [("100001", 12, 1, "silent_audio", _SPARSE_MSG)],
+        )
+        d = Database(path)
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '100001'"
+        ).fetchone()["silent_count"] == 12
+        d.conn.close()
+
+        # A row added later starts its own count; reopening must not raise it
+        # to its error_count just because the numbers happen to differ.
+        raw = sqlite3.connect(path)
+        raw.execute(
+            "INSERT INTO lectures (sub_id, course_id, error_count, silent_count,"
+            " error_stage, error_msg) VALUES ('100002', '38678', 9, 2,"
+            " 'silent_audio', ?)", (_SPARSE_MSG,),
+        )
+        raw.commit()
+        raw.close()
+
+        d = Database(path)
+        assert d.conn.execute(
+            "SELECT silent_count FROM lectures WHERE sub_id = '100002'"
+        ).fetchone()["silent_count"] == 2
+        d.conn.close()
+
+
+def test_merge_db_carries_the_backfill_flag_across():
+    """The flag has to survive the shard round-trip or the backfill repeats.
+
+    ``check.yml`` merges the local database into a freshly reassembled copy of
+    the remote one and shards *that*, so a ``meta`` key written only locally
+    would be dropped — and the next run would inflate the counters again.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        local_path = _modern_db(
+            tmp, [("100001", 12, 1, "silent_audio", _SPARSE_MSG)],
+        )
+        local = Database(local_path)          # applies the backfill + flag
+        assert local.read_meta(Database.BACKFILL_FLAG_KEY) == "1"
+        local.conn.close()
+
+        remote_path = _modern_db(tmp, [])
+        merge_db.merge(local_path, remote_path)
+
+        remote = sqlite3.connect(remote_path)
+        try:
+            assert remote.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (Database.BACKFILL_FLAG_KEY,),
+            ).fetchone() == ("1",)
+        finally:
+            remote.close()
