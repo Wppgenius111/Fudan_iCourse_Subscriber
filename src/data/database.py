@@ -53,6 +53,8 @@ class Database:
                     self.conn.execute(
                         f"ALTER TABLE lectures ADD COLUMN {col} {typedef}"
                     )
+                    if col == "silent_count":
+                        self._backfill_silent_count()
 
             existing_ppt = {
                 row[1]
@@ -65,6 +67,32 @@ class Database:
                     self.conn.execute(
                         f"ALTER TABLE ppt_pages ADD COLUMN {col} {typedef}"
                     )
+
+    #: Marker inside ``SparseAudioError``'s message — our own text, produced
+    #: by ``Transcriber._check_speech_density``.  Used only by the one-time
+    #: backfill below.
+    _SPARSE_MSG_MARKER = "%chars/min%"
+
+    def _backfill_silent_count(self):
+        """Seed ``silent_count`` from the failures already on record.
+
+        Runs exactly once, right after the column is added.  Without it every
+        existing row starts at 0, so a lecture that has already burned ten
+        runs would be handed another seven before ``silent_count`` reached
+        its ceiling — the opposite of the point.  ``error_count`` is the only
+        record of how many times the lecture has been tried, so copy it for
+        the rows whose last failure was a sparse-audio one.
+
+        Matches ``error_stage = 'transcribe'`` as well as the new
+        ``silent_audio``: rows written before this change carry the old
+        stage name.
+        """
+        self.conn.execute(
+            "UPDATE lectures SET silent_count = error_count"
+            " WHERE error_stage IN (?, 'transcribe')"
+            "   AND error_msg LIKE ?",
+            (self.SILENT_AUDIO_STAGE, self._SPARSE_MSG_MARKER),
+        )
 
     def write_meta(self, key: str, value: str):
         """Persist a key-value pair (e.g. COURSE_IDS from CI secret)."""
